@@ -182,6 +182,7 @@ sudo docker compose build cli && sudo docker compose run --rm cli check
 | `TELEGRAM_ALLOWED_USERS пуст` | не заполнен белый список — бот намеренно не стартует |
 | Бот молчит на любые сообщения | не тот `TELEGRAM_BOT_TOKEN`; проверьте `docker compose logs bot` |
 | «Нет доступа» в ответ на ФИО | ваш ID не в `TELEGRAM_ALLOWED_USERS`; узнайте его командой `/id` |
+| `Network is unreachable` к api.telegram.org | Телеграм недоступен с этого сервера: пропишите `TELEGRAM_PROXY` или разверните бота на VPS без блокировки |
 | `HTTP 401` от API | токен протух или отозван — повторите шаг 3.2 |
 | `HTTP 403` от API | токен получен не под администратором организации либо не выданы права `directory:write_users` |
 | `HTTP 404` от API | неверный `Y360_ORG_ID` |

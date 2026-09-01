@@ -192,8 +192,7 @@ def cmd_check(registry: OrgRegistry, directory: Directory, args) -> int:
         print(f"   ✓ отделов: {len(departments)}")
         users = directory.users(refresh=True)
         print(f"   ✓ сотрудников: {len(users)}")
-        print("\nВсё готово: docker compose up -d --build")
-        return 0
+        return _check_telegram()
     except ApiError as exc:
         print(f"   ✗ {exc}")
         if exc.status == 401:
@@ -204,6 +203,41 @@ def cmd_check(registry: OrgRegistry, directory: Directory, args) -> int:
         elif exc.status == 404:
             print(f"     Организации {org.org_id} не существует — проверьте Y360_ORG_ID.")
         return 1
+
+
+def _check_telegram() -> int:
+    """Последний шаг проверки: доступен ли api.telegram.org с этого сервера."""
+    import os
+
+    import requests
+
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    proxy = os.environ.get("TELEGRAM_PROXY") or None
+    print("5) Доступ к Telegram")
+    if not token or "..." in token or token.startswith("1234567890:"):
+        print("   ? TELEGRAM_BOT_TOKEN не заполнен — пропускаю")
+        return 0
+
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    try:
+        response = requests.get(
+            f"https://api.telegram.org/bot{token}/getMe", proxies=proxies, timeout=25
+        )
+    except requests.RequestException as exc:
+        print(f"   ✗ {str(exc).replace(token, '***')}")
+        print("     api.telegram.org с этого сервера недоступен — обычно это")
+        print("     блокировка у провайдера или отсутствие маршрута IPv6.")
+        print("     Варианты: указать прокси в TELEGRAM_PROXY")
+        print("     (socks5h://user:pass@host:1080) или перенести бота на другой VPS.")
+        return 1
+
+    if response.status_code == 401:
+        print("   ✗ Telegram не принял токен бота — проверьте TELEGRAM_BOT_TOKEN")
+        return 1
+    username = (response.json().get("result") or {}).get("username", "?")
+    print(f"   ✓ @{username}" + (" (через прокси)" if proxy else ""))
+    print("\nВсё готово: docker compose up -d --build")
+    return 0
 
 
 def _warn_duplicate_keys(path: str = ".env") -> None:

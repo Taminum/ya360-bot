@@ -53,7 +53,10 @@ DELETE_PHRASE = re.compile(r"^\s*удалить\s+(\S+)\s*$", re.IGNORECASE)
 
 class Bot:
     def __init__(self):
-        self.telegram = TelegramClient(require("TELEGRAM_BOT_TOKEN"))
+        self.telegram = TelegramClient(
+            require("TELEGRAM_BOT_TOKEN"),
+            proxy=os.environ.get("TELEGRAM_PROXY") or None,
+        )
         self.registry = OrgRegistry.load()
         self.state = State()
         self.allowed = self._parse_allowed(os.environ.get("TELEGRAM_ALLOWED_USERS", ""))

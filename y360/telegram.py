@@ -14,11 +14,20 @@ class TelegramError(RuntimeError):
 
 
 class TelegramClient:
-    def __init__(self, token: str, timeout: int = 25):
+    def __init__(self, token: str, timeout: int = 25, proxy: str | None = None):
         self.base = f"https://api.telegram.org/bot{token}"
         self.timeout = timeout
+        self._token = token
         self.session = requests.Session()
+        if proxy:
+            # прокси только для Телеграма: запросы к API 360 идут напрямую
+            self.session.proxies = {"http": proxy, "https": proxy}
+            log.info("Telegram через прокси %s", _mask_proxy(proxy))
         self.offset: int | None = None
+
+    def safe(self, text: object) -> str:
+        """Убирает токен бота из сообщений об ошибках — они попадают в логи."""
+        return str(text).replace(self._token, "***")
 
     def call(self, method: str, **params) -> Any:
         url = f"{self.base}/{method}"
@@ -28,7 +37,9 @@ class TelegramClient:
                     url, json=params, timeout=self.timeout + 10
                 )
             except requests.RequestException as exc:
-                log.warning("Telegram: сетевая ошибка (%s/5): %s", attempt, exc)
+                log.warning(
+                    "Telegram: сетевая ошибка (%s/5): %s", attempt, self.safe(exc)
+                )
                 time.sleep(min(2 ** attempt, 30))
                 continue
 
@@ -41,7 +52,7 @@ class TelegramClient:
                 log.warning("Telegram: 429, ждём %s c", wait)
                 time.sleep(wait)
                 continue
-            raise TelegramError(f"{method}: {data.get('description')}")
+            raise TelegramError(f"{method}: {self.safe(data.get('description'))}")
         raise TelegramError(f"{method}: не удалось выполнить запрос")
 
     def poll(self, long_poll_timeout: int = 25) -> Iterator[dict]:
@@ -120,7 +131,7 @@ class TelegramClient:
             )
         payload = response.json()
         if not payload.get("ok"):
-            raise TelegramError(f"sendDocument: {payload.get('description')}")
+            raise TelegramError(f"sendDocument: {self.safe(payload.get('description'))}")
         return payload["result"]
 
     def download_file(self, file_id: str, destination) -> None:
@@ -146,3 +157,15 @@ class TelegramClient:
             )
         except TelegramError as exc:
             log.debug("setMyCommands: %s", exc)
+
+
+def _mask_proxy(proxy: str) -> str:
+    """socks5://user:pass@host:1080 -> socks5://user:***@host:1080"""
+    if "@" not in proxy:
+        return proxy
+    head, _, tail = proxy.rpartition("@")
+    scheme, _, credentials = head.partition("://")
+    user, _, password = credentials.partition(":")
+    if not password:
+        return proxy
+    return f"{scheme}://{user}:***@{tail}"
