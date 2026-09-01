@@ -1,9 +1,12 @@
 """Состояние бота между перезапусками: выбранная организация и архив счетов."""
 
 import json
+import logging
 import os
 import threading
 from pathlib import Path
+
+log = logging.getLogger("y360.state")
 
 
 def data_dir() -> Path:
@@ -26,12 +29,10 @@ class State:
                 pass  # битый файл не должен мешать боту стартовать
 
     def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        os.replace(tmp, self.path)
+        try:
+            _write_json(self.path, self._data)
+        except OSError as exc:
+            log.warning("Не сохранил %s: %s", self.path, exc)
 
     # --- выбранная организация -------------------------------------------
     def chat_org(self, chat_id: int) -> str | None:
@@ -85,25 +86,23 @@ class PasswordStore:
     def _key(org_key: str, nickname: str) -> str:
         return f"{org_key}:{nickname.lower()}"
 
-    def save(self, org_key: str, nickname: str, password: str, **extra) -> None:
+    def save(self, org_key: str, nickname: str, password: str, **extra) -> bool:
+        """True, если пароль действительно записан на диск."""
         if not self.enabled or not nickname:
-            return
+            return False
         with self._lock:
             self._data[self._key(org_key, nickname)] = {
                 "password": password,
                 "nickname": nickname,
                 **extra,
             }
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(
-                json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            os.replace(tmp, self.path)
             try:
+                _write_json(self.path, self._data)
                 os.chmod(self.path, 0o600)  # только владелец
-            except OSError:
-                pass
+                return True
+            except OSError as exc:
+                log.warning("Не сохранил пароль в %s: %s", self.path, exc)
+                return False
 
     def get(self, org_key: str, nickname: str) -> dict | None:
         return self._data.get(self._key(org_key, nickname))
@@ -115,3 +114,24 @@ class PasswordStore:
             for key, record in self._data.items()
             if key.startswith(prefix)
         }
+
+
+def _write_json(path: Path, data: dict) -> None:
+    """Атомарная запись: сначала во временный файл, потом подмена."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def writable(path: Path | None = None) -> str:
+    """Пустая строка, если каталог данных доступен на запись, иначе описание беды."""
+    target = Path(path) if path else data_dir()
+    probe = target / ".write-test"
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return ""
+    except OSError as exc:
+        return str(exc)

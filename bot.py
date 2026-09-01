@@ -21,7 +21,7 @@ from y360.csvio import read_rows, write_rows
 from y360.names import generate_password
 from y360.orgs import Org, OrgRegistry
 from y360.service import Directory, NewUser
-from y360.state import PasswordStore, State, data_dir
+from y360.state import PasswordStore, State, data_dir, writable
 from y360.telegram import TelegramClient, TelegramError
 from y360 import xlsx
 
@@ -51,6 +51,11 @@ AUDIT_FIELDS = [
     "at", "org", "action", "last", "first", "middle", "nickname", "email",
     "password", "department", "position", "telegram_user", "status", "error",
 ]
+
+_VAULT_WARNING = (
+    "\n⚠️ Пароль не сохранён в архив: нет прав на запись в data/.\n"
+    "На сервере: <code>sudo chown -R 10001:10001 data</code>"
+)
 
 DELETE_PHRASE = re.compile(r"^\s*удалить\s+(\S+)\s*$", re.IGNORECASE)
 
@@ -118,6 +123,13 @@ class Bot:
 
     # --- цикл -------------------------------------------------------------
     def run(self) -> None:
+        problem = writable()
+        if problem:
+            log.error(
+                "Каталог данных недоступен для записи (%s). Журнал, пароли и архив "
+                "счетов сохраняться не будут. На сервере выполните: "
+                "sudo chown -R 10001:10001 data", problem,
+            )
         me = self.telegram.call("getMe")
         log.info(
             "Бот @%s запущен. Организаций: %s, доступ у %s пользователей",
@@ -439,11 +451,14 @@ class Bot:
         if self.auto_delete:
             lines.append(f"<i>Сообщение удалится через {self.auto_delete} с.</i>")
 
-        self.telegram.edit(chat_id, message_id, "\n".join(lines))
-        self.vault.save(
+        saved = self.vault.save(
             org.key, new_user.nickname, new_user.password,
             email=email, at=_now(), by=_who(sender), action="create",
         )
+        if self.vault.enabled and not saved:
+            lines.append(_VAULT_WARNING)
+
+        self.telegram.edit(chat_id, message_id, "\n".join(lines))
         self._audit(org, "create", new_user, email, sender, "ok", "")
         if self.auto_delete:
             self.to_delete.append((chat_id, message_id, time.time() + self.auto_delete))
@@ -488,7 +503,7 @@ class Bot:
             self.telegram.send(chat_id, _api_error(exc))
             return
 
-        self.vault.save(
+        saved = self.vault.save(
             org.key, str(user.get("nickname", "")), password,
             email=str(user.get("email", "")), at=_now(), by=_who(sender),
             action="reset",
@@ -504,6 +519,8 @@ class Bot:
         ]
         if org.password_change_required:
             lines.append("\n<i>Сменить при первом входе.</i>")
+        if self.vault.enabled and not saved:
+            lines.append(_VAULT_WARNING)
         sent = self.telegram.send(chat_id, "\n".join(lines))
         if self.auto_delete:
             self.to_delete.append(
