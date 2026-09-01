@@ -16,6 +16,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from y360.activity import collect_activity, find_dormant
 from y360.api import ApiError
 from y360.config import load_env, require
 from y360.csvio import read_rows, write_rows
@@ -42,6 +43,7 @@ HELP = """<b>Что умею</b>
 /dept — отделы с их ID
 /export — все сотрудники таблицей
 /last — кого заводили последними
+/dead — ящики без активности (по умолчанию 90 дней, можно /dead 30)
 /journal — весь журнал файлом
 /backup — прислать копию данных бота
 /settings — длина пароля, шаблон логина и прочее
@@ -66,6 +68,7 @@ MENU = {
     "🔍 Найти": "find",
     "📊 Выгрузка": "export",
     "🕘 Последние": "last",
+    "💤 Неактивные": "dead",
     "⚙️ Настройки": "settings",
     "💳 Счета": "bill",
     "🏢 Отделы": "dept",
@@ -75,7 +78,8 @@ KEYBOARD = {
     "keyboard": [
         [{"text": "🔍 Найти"}, {"text": "📊 Выгрузка"}],
         [{"text": "🕘 Последние"}, {"text": "🏢 Отделы"}],
-        [{"text": "💳 Счета"}, {"text": "⚙️ Настройки"}],
+        [{"text": "💤 Неактивные"}, {"text": "💳 Счета"}],
+        [{"text": "⚙️ Настройки"}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -133,6 +137,7 @@ class Bot:
             os.environ.get("BOT_AUDIT_FILE", str(data_dir() / "journal.csv"))
         )
         self.backup_days = int(os.environ.get("BOT_BACKUP_DAYS", "0") or 0)
+        self.dormant_days = int(os.environ.get("BOT_DORMANT_DAYS", "90") or 90)
         self.invoices_dir = Path(
             os.environ.get("BOT_INVOICES_DIR", str(data_dir() / "invoices"))
         )
@@ -210,6 +215,7 @@ class Bot:
             ("dept", "Список отделов"),
             ("export", "Выгрузить всех в таблицу"),
             ("last", "Последние заведённые"),
+            ("dead", "Неиспользуемые ящики"),
             ("settings", "Настройки"),
             ("journal", "Журнал файлом"),
             ("backup", "Копия данных"),
@@ -272,6 +278,8 @@ class Bot:
             self.cmd_settings(chat_id)
         elif text.startswith("/last"):
             self.cmd_last(chat_id)
+        elif text.startswith("/dead") or text.startswith("/inactive"):
+            self.cmd_dormant(chat_id, text.split(" ", 1)[-1] if " " in text else "")
         elif text.startswith("/find"):
             self.cmd_find(chat_id, text[len("/find"):].strip())
         elif text.startswith("/bill"):
@@ -860,6 +868,105 @@ class Bot:
             lines.append("При первом входе система попросит сменить пароль.")
         self.telegram.send(chat_id, "\n".join(lines))
 
+    # --- неиспользуемые ящики --------------------------------------------------
+    def cmd_dormant(self, chat_id: int, argument: str = "") -> None:
+        days = int(argument) if argument.strip().isdigit() else self.dormant_days
+        days = max(7, min(days, 365))
+        org = self.org_for(chat_id)
+        directory = self.directory_for(chat_id)
+
+        notice = self.telegram.send(
+            chat_id,
+            f"⏳ Смотрю журнал Почты за {days} дн. Это может занять минуту…",
+        )
+        try:
+            users = directory.users(refresh=True)
+            active, passive, truncated = collect_activity(directory.client, days)
+        except ApiError as exc:
+            self.telegram.edit(
+                chat_id, notice["message_id"],
+                _api_error(exc) + (
+                    "\n\n<i>Для этой команды приложению нужно право "
+                    "<code>ya360_security:audit_log_mail</code>. Добавьте его на "
+                    "oauth.yandex.ru и выпустите токен заново.</i>"
+                    if exc.status in (401, 403) else ""
+                ),
+            )
+            return
+
+        dormant = find_dormant(users, active, passive, days)
+        blocked = [item for item in dormant if not item.enabled]
+        idle = [item for item in dormant if item.enabled]
+
+        lines = [
+            self.org_prefix(chat_id) + f"<b>Неиспользуемые ящики за {days} дн.</b>",
+            f"Всего сотрудников: {len(users)} · без активности: {len(dormant)}",
+            "",
+        ]
+        if idle:
+            lines.append(f"<b>Активны, но не пользуются ({len(idle)})</b>")
+            for item in idle[:20]:
+                mark = " · письма приходят" if item.received_only else ""
+                lines.append(
+                    f"• {html.escape(item.full_name)} — "
+                    f"<code>{html.escape(item.email)}</code>{mark}"
+                )
+        if blocked:
+            lines.append("")
+            lines.append(f"<b>Заблокированы ({len(blocked)})</b> — платите за них зря")
+            for item in blocked[:20]:
+                lines.append(
+                    f"• {html.escape(item.full_name)} — "
+                    f"<code>{html.escape(item.email)}</code>"
+                )
+        if not dormant:
+            lines.append("Все пользуются почтой — лишних ящиков нет.")
+        if len(dormant) > 20:
+            lines.append("")
+            lines.append("<i>Показаны первые 20, полный список — в файле.</i>")
+        if truncated:
+            lines.append("")
+            lines.append(
+                "<i>⚠️ Журнал очень большой, просмотрена только часть. "
+                "Возьмите период поменьше, например /dead 30.</i>"
+            )
+        lines.append("")
+        lines.append(
+            "<i>Активностью считаются действия сотрудника: отправка, чтение, "
+            "перемещение писем. Входящие письма сами по себе активностью не "
+            "считаются.</i>"
+        )
+
+        self.telegram.edit(chat_id, notice["message_id"], "\n".join(lines))
+
+        if len(dormant) > 20:
+            self._send_dormant_file(chat_id, org, dormant, days)
+
+    def _send_dormant_file(self, chat_id: int, org: Org, dormant: list, days: int) -> None:
+        fields = ["last", "first", "nickname", "email", "is_enabled", "created_at", "note"]
+        rows = [{
+            "last": (item.user.get("name") or {}).get("last", ""),
+            "first": (item.user.get("name") or {}).get("first", ""),
+            "nickname": item.user.get("nickname", ""),
+            "email": item.email,
+            "is_enabled": "да" if item.enabled else "нет",
+            "created_at": item.created,
+            "note": "письма приходят, но не читаются" if item.received_only else "",
+        } for item in dormant]
+
+        stamp = datetime.now().strftime("%Y-%m-%d")
+        target = data_dir() / "exports" / f"{org.key}_dormant_{days}d_{stamp}"
+        try:
+            if xlsx.available():
+                path = xlsx.write_users(target.with_suffix(".xlsx"), rows, fields)
+            else:
+                path = write_rows(target.with_suffix(".csv"), rows, fields)
+            self.telegram.upload_document(
+                chat_id, str(path), f"Без активности за {days} дн.: {len(rows)}"
+            )
+        except Exception:
+            log.exception("Не собрал файл с неактивными")
+
     # --- копия данных и журнал ------------------------------------------------
     def cmd_backup(self, chat_id: int, quiet: bool = False) -> None:
         """Журнал, пароли, настройки и архив счетов — одним архивом в чат."""
@@ -1028,6 +1135,22 @@ class Bot:
     def cmd_bill(self, chat_id: int) -> None:
         org = self.org_for(chat_id)
         invoices = self.state.invoices(org.key, limit=12)
+        counters = ""
+        try:
+            users = self.directory_for(chat_id).users()
+            blocked = sum(1 for user in users if not user.get("isEnabled", True))
+            counters = (
+                f"Сотрудников: <b>{len(users)}</b>"
+                + (f" · заблокированных: <b>{blocked}</b>" if blocked else "")
+            )
+            if blocked:
+                counters += (
+                    "\n<i>За заблокированных оплата обычно идёт — "
+                    "проверьте /dead.</i>"
+                )
+        except ApiError:
+            pass  # счётчик — приятное дополнение, без него команда всё равно работает
+
         text = [
             self.org_prefix(chat_id) + "<b>Оплата</b>",
             f'Счёт и закрывающие документы: <a href="{org.billing_url}">админка → '
@@ -1035,6 +1158,8 @@ class Bot:
             "<i>API 360 счета не отдаёт, поэтому выгрузить их автоматически нельзя — "
             "скачайте из админки и пришлите сюда файлом, я сохраню в архив.</i>",
         ]
+        if counters:
+            text.insert(1, counters)
         markup = None
         if invoices:
             text.append("\n<b>Архив</b>")

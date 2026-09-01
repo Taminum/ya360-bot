@@ -9,6 +9,7 @@ from datetime import datetime
 from .api import ApiError, Y360Client
 from .config import load_env
 from .csvio import GENDER_ALIASES, read_rows, write_rows
+from .activity import collect_activity, find_dormant
 from .orgs import OrgRegistry
 from .service import Directory, NewUser
 from . import xlsx
@@ -46,6 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub.add_parser("orgs", help="настроенные организации и их ID")
     sub.add_parser("dept", help="список отделов")
+
+    dormant = sub.add_parser(
+        "dormant", help="ящики без активности в Почте (кандидаты на удаление)"
+    )
+    dormant.add_argument("--days", type=int, default=90, help="период, дней")
+    dormant.add_argument("-o", "--out", help="файл выгрузки (.xlsx или .csv)")
 
     export = sub.add_parser("export", help="выгрузить всех сотрудников в CSV")
     export.add_argument(
@@ -117,6 +124,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_orgs(registry, directory)
         if args.command == "dept":
             return cmd_departments(directory)
+        if args.command == "dormant":
+            return cmd_dormant(directory, args)
         if args.command == "export":
             return cmd_export(directory, args)
         if args.command == "create":
@@ -292,6 +301,39 @@ def cmd_departments(directory: Directory) -> int:
             f"{department.get('id')}\t{department.get('name')}"
             f"\t(сотрудников: {department.get('membersCount', 0)})"
         )
+    return 0
+
+
+def cmd_dormant(directory: Directory, args) -> int:
+    days = max(7, min(args.days, 365))
+    print(f"Читаю аудит-лог Почты за {days} дн. …")
+    users = directory.users(refresh=True)
+    active, passive, truncated = collect_activity(directory.client, days)
+    dormant = find_dormant(users, active, passive, days)
+
+    print(f"Сотрудников: {len(users)}, без активности: {len(dormant)}")
+    for item in dormant:
+        status = "активен" if item.enabled else "заблокирован"
+        note = ", письма приходят" if item.received_only else ""
+        print(f"  {item.email}	{item.full_name}	{status}{note}")
+    if truncated:
+        print("Внимание: журнал большой, просмотрена только часть — уменьшите --days")
+
+    if args.out and dormant:
+        fields = ["last", "first", "nickname", "email", "is_enabled", "created_at"]
+        rows = [{
+            "last": (item.user.get("name") or {}).get("last", ""),
+            "first": (item.user.get("name") or {}).get("first", ""),
+            "nickname": item.user.get("nickname", ""),
+            "email": item.email,
+            "is_enabled": "да" if item.enabled else "нет",
+            "created_at": item.created,
+        } for item in dormant]
+        if str(args.out).lower().endswith(".xlsx") and xlsx.available():
+            path = xlsx.write_users(args.out, rows, fields)
+        else:
+            path = write_rows(args.out, rows, fields)
+        print(f"Список сохранён: {path}")
     return 0
 
 

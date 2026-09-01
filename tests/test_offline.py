@@ -16,6 +16,7 @@ class FakeClient:
     def __init__(self):
         self.created: list[dict] = []
         self.aliases: list[tuple[str, str]] = []
+        self.events: list[dict] = []
 
     def departments(self):
         return [
@@ -47,6 +48,9 @@ class FakeClient:
     def add_alias(self, user_id, alias):
         self.aliases.append((user_id, alias))
         return {"alias": alias}
+
+    def audit_log_mail(self, after_date, before_date=None, page_size=100, max_pages=500):
+        return iter(self.events)
 
 
 
@@ -368,6 +372,61 @@ def test_xlsx():
         check([c.value for c in sheet[2]][4] == "sec", "пароль попал в таблицу")
 
 
+def test_dormant():
+    print("поиск неиспользуемых ящиков")
+    from datetime import datetime, timedelta, timezone
+
+    from y360.activity import collect_activity, find_dormant
+
+    now = datetime.now(timezone.utc)
+    old_date = (now - timedelta(days=200)).isoformat()
+    fresh = (now - timedelta(days=3)).isoformat().replace("+00:00", "Z")
+
+    client = FakeClient()
+    client.events = [
+        # активный сотрудник: читает и отправляет письма
+        {"userLogin": "ivan.ivanov", "eventType": "message_seen", "date": fresh},
+        {"userLogin": "ivan.ivanov", "eventType": "mailbox_send", "date": fresh},
+        # этому только приходят письма — сам он в ящик не заходит
+        {"userLogin": "maria.petrova", "eventType": "message_receive", "date": fresh},
+    ]
+    active, passive, truncated = collect_activity(client, 90)
+    check("ivan.ivanov" in active, "действия сотрудника попали в активность")
+    check("maria.petrova" not in active, "входящее письмо активностью не считается")
+    check("maria.petrova" in passive, "но факт входящих запомнен")
+    check(truncated is False, "лимит страниц не задет")
+
+    users = [
+        {"id": "1", "nickname": "ivan.ivanov", "email": "ivan.ivanov@e.ru",
+         "isEnabled": True, "createdAt": old_date, "name": {"first": "Иван", "last": "Иванов"}},
+        {"id": "2", "nickname": "maria.petrova", "email": "maria.petrova@e.ru",
+         "isEnabled": True, "createdAt": old_date, "name": {"first": "Мария", "last": "Петрова"}},
+        {"id": "3", "nickname": "old.blocked", "email": "old.blocked@e.ru",
+         "isEnabled": False, "createdAt": old_date, "name": {"first": "Пётр", "last": "Старый"}},
+        {"id": "4", "nickname": "new.hire", "email": "new.hire@e.ru", "isEnabled": True,
+         "createdAt": (now - timedelta(days=5)).isoformat(),
+         "name": {"first": "Новый", "last": "Сотрудник"}},
+        {"id": "5", "nickname": "robot", "email": "robot@e.ru", "isEnabled": True,
+         "isRobot": True, "createdAt": old_date, "name": {"first": "Робот", "last": ""}},
+    ]
+    dormant = find_dormant(users, active, passive, 90)
+    logins = {item.user["nickname"] for item in dormant}
+
+    check("ivan.ivanov" not in logins, "активный сотрудник не в списке мёртвых")
+    check("maria.petrova" in logins, "не читает почту — кандидат")
+    check("old.blocked" in logins, "заблокированный — кандидат на удаление")
+    check("new.hire" not in logins, "недавно заведённого не трогаем")
+    check("robot" not in logins, "роботы не считаются")
+
+    maria = next(item for item in dormant if item.user["nickname"] == "maria.petrova")
+    check(maria.received_only, "видно, что письма ему приходят")
+    check(maria.full_name == "Петрова Мария", "ФИО собирается для отчёта")
+    check(
+        [item.user["nickname"] for item in dormant][0] == "old.blocked",
+        "заблокированные показываются первыми",
+    )
+
+
 def test_bot_wiring():
     print("сборка бота (без сети)")
     import os
@@ -537,6 +596,7 @@ def main():
         test_orgs_registry,
         test_state,
         test_delete_guard,
+        test_dormant,
         test_password_store,
         test_xlsx,
         test_bot_wiring,

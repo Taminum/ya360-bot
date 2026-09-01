@@ -97,6 +97,40 @@ class Y360Client:
                 return
             page += 1
 
+    def paginate_token(
+        self, path: str, key: str, params: dict, max_pages: int = 500
+    ) -> Iterator[dict]:
+        """Пагинация через nextPageToken — так устроены аудит-логи."""
+        token = None
+        for _ in range(max_pages):
+            query = dict(params)
+            if token:
+                query["pageToken"] = token
+            data = self.request("GET", path, params=query)
+            for item in data.get(key, []):
+                yield item
+            token = data.get("nextPageToken")
+            if not token:
+                return
+        log.warning("Достигнут предел в %s страниц для %s", max_pages, path)
+
+    # --- аудит-лог ------------------------------------------------------
+    def audit_log_mail(
+        self,
+        after_date: str,
+        before_date: str | None = None,
+        page_size: int = 100,
+        max_pages: int = 500,
+    ) -> Iterator[dict]:
+        """События Почты за период. Нужно право ya360_security:audit_log_mail."""
+        params: dict[str, Any] = {"pageSize": page_size, "afterDate": after_date}
+        if before_date:
+            params["beforeDate"] = before_date
+        return self.paginate_token(
+            f"/security/v1/org/{self._org()}/audit_log/mail",
+            "events", params, max_pages,
+        )
+
     # --- организации ----------------------------------------------------
     def organizations(self) -> list[dict]:
         data = self.request("GET", "/directory/v1/org", params={"perPage": 100})
