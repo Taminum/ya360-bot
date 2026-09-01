@@ -57,7 +57,7 @@
 Подробно, с картой «что где брать» — [INSTALL.md](INSTALL.md). Кратко:
 
 ```bash
-git clone <адрес-репозитория> ya360-bot && cd ya360-bot
+git clone https://github.com/Taminum/ya360-bot.git && cd ya360-bot
 ```
 
 ```bash
