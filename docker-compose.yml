@@ -1,0 +1,33 @@
+services:
+  bot:
+    build: .
+    image: ya360-bot
+    container_name: ya360-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # несколько организаций описываются в config/orgs.json;
+      # для одной файл не нужен — хватит Y360_TOKEN и Y360_ORG_ID из .env
+      Y360_ORGS_FILE: /app/config/orgs.json
+    volumes:
+      # журнал операций, выбранная организация, архив счетов
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # разовые команды: docker compose run --rm cli export -o data/users.csv
+  cli:
+    build: .
+    image: ya360-bot
+    profiles: ["tools"]
+    env_file: .env
+    environment:
+      Y360_ORGS_FILE: /app/config/orgs.json
+    entrypoint: ["python", "-m", "y360"]
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro

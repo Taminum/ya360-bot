@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+config/orgs.json
+data/
+out/
+__pycache__/
+*.pyc
+README.md
+examples/*.xlsx

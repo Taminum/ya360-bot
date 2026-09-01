@@ -1,0 +1,8 @@
+.env
+orgs.json
+config/orgs.json
+data/
+out/
+__pycache__/
+*.pyc
+*.log

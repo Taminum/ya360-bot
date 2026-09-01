@@ -1,0 +1,25 @@
+{
+  "orgs": [
+    {
+      "key": "romashka",
+      "name": "ООО Ромашка",
+      "org_id": "1234567",
+      "token": "y0_AgAAAAA...",
+      "domain": "romashka.ru",
+      "default_department": "",
+      "nickname_pattern": "{first}.{last}",
+      "password_length": 14,
+      "password_change_required": true,
+      "allow_delete": false
+    },
+    {
+      "key": "vtoraya",
+      "name": "ИП Иванов",
+      "org_id": "7654321",
+      "token": "$IVANOV_TOKEN",
+      "domain": "ivanov.ru",
+      "nickname_pattern": "{f}{last}",
+      "allow_delete": true
+    }
+  ]
+}
