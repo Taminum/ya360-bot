@@ -390,11 +390,13 @@ def test_dormant():
         # этому только приходят письма — сам он в ящик не заходит
         {"userLogin": "maria.petrova", "eventType": "message_receive", "date": fresh},
     ]
-    active, passive, truncated = collect_activity(client, 90)
-    check("ivan.ivanov" in active, "действия сотрудника попали в активность")
-    check("maria.petrova" not in active, "входящее письмо активностью не считается")
-    check("maria.petrova" in passive, "но факт входящих запомнен")
-    check(truncated is False, "лимит страниц не задет")
+    scan = collect_activity(client, 90)
+    check("ivan.ivanov" in scan.active, "действия сотрудника попали в активность")
+    check("maria.petrova" not in scan.active, "входящее письмо активностью не считается")
+    check("maria.petrova" in scan.passive, "но факт входящих запомнен")
+    check(scan.truncated is False, "лимит страниц не задет")
+    check(scan.events == 3, "события посчитаны")
+    check(len(scan.samples) == 3, "образцы событий сохранены для отладки")
 
     users = [
         {"id": "1", "nickname": "ivan.ivanov", "email": "ivan.ivanov@e.ru",
@@ -409,7 +411,7 @@ def test_dormant():
         {"id": "5", "nickname": "robot", "email": "robot@e.ru", "isEnabled": True,
          "isRobot": True, "createdAt": old_date, "name": {"first": "Робот", "last": ""}},
     ]
-    dormant = find_dormant(users, active, passive, 90)
+    dormant = find_dormant(users, scan, 90)
     logins = {item.user["nickname"] for item in dormant}
 
     check("ivan.ivanov" not in logins, "активный сотрудник не в списке мёртвых")
@@ -417,6 +419,18 @@ def test_dormant():
     check("old.blocked" in logins, "заблокированный — кандидат на удаление")
     check("new.hire" not in logins, "недавно заведённого не трогаем")
     check("robot" not in logins, "роботы не считаются")
+
+    # журнал может называть человека uid-ом или полным адресом, а не логином
+    other = FakeClient()
+    other.events = [
+        {"userUid": "1", "userLogin": "", "eventType": "mailbox_send", "date": fresh},
+        {"userUid": "", "userLogin": "MARIA.PETROVA@E.RU", "eventType": "message_seen",
+         "date": fresh},
+    ]
+    scan2 = collect_activity(other, 90)
+    dormant2 = {item.user["nickname"] for item in find_dormant(users, scan2, 90)}
+    check("ivan.ivanov" not in dormant2, "опознан по uid без логина")
+    check("maria.petrova" not in dormant2, "опознан по полному адресу в другом регистре")
 
     maria = next(item for item in dormant if item.user["nickname"] == "maria.petrova")
     check(maria.received_only, "видно, что письма ему приходят")

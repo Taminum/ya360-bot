@@ -4,7 +4,7 @@
 это прямые деньги. Активность считаем по аудит-логу Почты.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 # Действия, которые совершает сам сотрудник.
@@ -25,11 +25,25 @@ ACTIVE_EVENTS = {
 
 
 @dataclass
+class ActivityScan:
+    """Что удалось вычитать из аудит-лога."""
+
+    active: dict[str, datetime] = field(default_factory=dict)
+    passive: dict[str, datetime] = field(default_factory=dict)
+    events: int = 0
+    truncated: bool = False
+    samples: list[dict] = field(default_factory=list)
+
+    @property
+    def people(self) -> int:
+        return len(self.active)
+
+
+@dataclass
 class Dormant:
     """Сотрудник без активности за период."""
 
     user: dict
-    last_seen: datetime | None
     received_only: bool  # письма приходили, но человек их не открывал
 
     @property
@@ -59,46 +73,75 @@ def iso_days_ago(days: int) -> str:
     return moment.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def collect_activity(client, days: int, max_pages: int = 500) -> tuple[dict, dict, bool]:
-    """Возвращает (активность по логинам, только-входящие, был ли обрыв по лимиту).
+def event_keys(event: dict) -> set[str]:
+    """Все обозначения человека в событии: uid, логин, адрес без домена."""
+    keys = set()
+    uid = str(event.get("userUid") or "").strip()
+    if uid:
+        keys.add(uid)
+    login = str(event.get("userLogin") or "").strip().lower()
+    if login:
+        keys.add(login)
+        keys.add(login.split("@")[0])
+    return keys
 
-    Ключ — логин в нижнем регистре, значение — время последнего действия.
-    """
-    active: dict[str, datetime] = {}
-    passive: dict[str, datetime] = {}
-    seen_events = 0
+
+def user_keys(user: dict) -> set[str]:
+    """Те же обозначения со стороны справочника сотрудников."""
+    keys = set()
+    uid = str(user.get("id") or "").strip()
+    if uid:
+        keys.add(uid)
+    nickname = str(user.get("nickname") or "").strip().lower()
+    if nickname:
+        keys.add(nickname)
+    email = str(user.get("email") or "").strip().lower()
+    if email:
+        keys.add(email)
+        keys.add(email.split("@")[0])
+    for alias in user.get("aliases") or []:
+        alias = str(alias).strip().lower()
+        if alias:
+            keys.add(alias)
+            keys.add(alias.split("@")[0])
+    return keys
+
+
+def collect_activity(client, days: int, max_pages: int = 500) -> ActivityScan:
+    """Читает аудит-лог Почты и раскладывает события по людям."""
+    scan = ActivityScan()
 
     for event in client.audit_log_mail(iso_days_ago(days), max_pages=max_pages):
-        seen_events += 1
-        login = str(event.get("userLogin", "")).lower()
-        if not login:
-            continue
+        scan.events += 1
+        if len(scan.samples) < 5:
+            scan.samples.append({
+                "userUid": event.get("userUid"),
+                "userLogin": event.get("userLogin"),
+                "eventType": event.get("eventType"),
+                "date": event.get("date"),
+            })
         moment = _parse_date(event.get("date"))
         if not moment:
             continue
-        target = active if event.get("eventType") in ACTIVE_EVENTS else passive
-        if login not in target or moment > target[login]:
-            target[login] = moment
+        target = scan.active if event.get("eventType") in ACTIVE_EVENTS else scan.passive
+        for key in event_keys(event):
+            if key not in target or moment > target[key]:
+                target[key] = moment
 
     # упёрлись в лимит страниц — часть событий могла не попасть в выборку
-    return active, passive, seen_events >= max_pages * 100
+    scan.truncated = scan.events >= max_pages * 100
+    return scan
 
 
-def find_dormant(users: list[dict], active: dict, passive: dict, days: int) -> list[Dormant]:
+def find_dormant(users: list[dict], scan: ActivityScan, days: int) -> list[Dormant]:
     """Сотрудники без действий за период. Недавно заведённых не трогаем."""
     threshold = datetime.now(timezone.utc) - timedelta(days=days)
     result = []
     for user in users:
         if user.get("isRobot"):
             continue
-        login = str(user.get("nickname", "")).lower()
-        email_login = str(user.get("email", "")).split("@")[0].lower()
-        keys = {key for key in (login, email_login) if key}
-
-        last_seen = max(
-            (active[key] for key in keys if key in active), default=None
-        )
-        if last_seen:
+        keys = user_keys(user)
+        if any(key in scan.active for key in keys):
             continue  # человек пользуется почтой
 
         created = _parse_date(user.get("createdAt"))
@@ -108,8 +151,7 @@ def find_dormant(users: list[dict], active: dict, passive: dict, days: int) -> l
         result.append(
             Dormant(
                 user=user,
-                last_seen=None,
-                received_only=any(key in passive for key in keys),
+                received_only=any(key in scan.passive for key in keys),
             )
         )
     return sorted(result, key=lambda item: (item.enabled, item.created))

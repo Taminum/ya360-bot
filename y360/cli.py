@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     dormant = sub.add_parser(
         "dormant", help="ящики без активности в Почте (кандидаты на удаление)"
     )
-    dormant.add_argument("--days", type=int, default=90, help="период, дней")
+    dormant.add_argument("--days", type=int, default=30, help="период, дней")
     dormant.add_argument("-o", "--out", help="файл выгрузки (.xlsx или .csv)")
 
     export = sub.add_parser("export", help="выгрузить всех сотрудников в CSV")
@@ -308,15 +308,20 @@ def cmd_dormant(directory: Directory, args) -> int:
     days = max(7, min(args.days, 365))
     print(f"Читаю аудит-лог Почты за {days} дн. …")
     users = directory.users(refresh=True)
-    active, passive, truncated = collect_activity(directory.client, days)
-    dormant = find_dormant(users, active, passive, days)
+    scan = collect_activity(directory.client, days)
+    dormant = find_dormant(users, scan, days)
 
-    print(f"Сотрудников: {len(users)}, без активности: {len(dormant)}")
+    print(
+        f"Сотрудников: {len(users)}, событий в журнале: {scan.events}, "
+        f"без активности: {len(dormant)}"
+    )
+    if scan.samples and args.verbose:
+        print("Пример события:", scan.samples[0])
     for item in dormant:
         status = "активен" if item.enabled else "заблокирован"
         note = ", письма приходят" if item.received_only else ""
         print(f"  {item.email}	{item.full_name}	{status}{note}")
-    if truncated:
+    if scan.truncated:
         print("Внимание: журнал большой, просмотрена только часть — уменьшите --days")
 
     if args.out and dormant:

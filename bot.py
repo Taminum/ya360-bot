@@ -16,7 +16,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from y360.activity import collect_activity, find_dormant
+from y360.activity import collect_activity, find_dormant, user_keys
 from y360.api import ApiError
 from y360.config import load_env, require
 from y360.csvio import read_rows, write_rows
@@ -43,7 +43,7 @@ HELP = """<b>Что умею</b>
 /dept — отделы с их ID
 /export — все сотрудники таблицей
 /last — кого заводили последними
-/dead — ящики без активности (по умолчанию 90 дней, можно /dead 30)
+/dead — ящики без активности (период в /settings, разово: /dead 90)
 /journal — весь журнал файлом
 /backup — прислать копию данных бота
 /settings — длина пароля, шаблон логина и прочее
@@ -103,6 +103,9 @@ SETTINGS_CHOICES = {
     "name_order": ("Порядок слов в ФИО", [
         ("Фамилия Имя", "last_first"), ("Имя Фамилия", "first_last"),
     ]),
+    "dormant_days": ("Период поиска неактивных", [
+        ("30 дней", 30), ("60 дней", 60), ("90 дней", 90), ("180 дней", 180),
+    ]),
     "auto_delete": ("Удалять пароль из чата", [
         ("не удалять", 0), ("через 1 минуту", 60),
         ("через 5 минут", 300), ("через 15 минут", 900),
@@ -137,7 +140,7 @@ class Bot:
             os.environ.get("BOT_AUDIT_FILE", str(data_dir() / "journal.csv"))
         )
         self.backup_days = int(os.environ.get("BOT_BACKUP_DAYS", "0") or 0)
-        self.dormant_days = int(os.environ.get("BOT_DORMANT_DAYS", "90") or 90)
+        self.dormant_days = int(os.environ.get("BOT_DORMANT_DAYS", "30") or 30)
         self.invoices_dir = Path(
             os.environ.get("BOT_INVOICES_DIR", str(data_dir() / "invoices"))
         )
@@ -178,6 +181,7 @@ class Bot:
             "password_change_required": org.password_change_required,
             "name_order": self.name_order,
             "auto_delete": self.auto_delete,
+            "dormant_days": self.dormant_days,
         }[name]
 
     def delay_for(self, chat_id: int) -> int:
@@ -870,10 +874,14 @@ class Bot:
 
     # --- неиспользуемые ящики --------------------------------------------------
     def cmd_dormant(self, chat_id: int, argument: str = "") -> None:
-        days = int(argument) if argument.strip().isdigit() else self.dormant_days
-        days = max(7, min(days, 365))
         org = self.org_for(chat_id)
         directory = self.directory_for(chat_id)
+        debug = argument.strip().lower() in {"debug", "отладка", "?"}
+        days = (
+            int(argument) if argument.strip().isdigit()
+            else int(self.setting(org, "dormant_days"))
+        )
+        days = max(7, min(days, 365))
 
         notice = self.telegram.send(
             chat_id,
@@ -881,7 +889,7 @@ class Bot:
         )
         try:
             users = directory.users(refresh=True)
-            active, passive, truncated = collect_activity(directory.client, days)
+            scan = collect_activity(directory.client, days)
         except ApiError as exc:
             self.telegram.edit(
                 chat_id, notice["message_id"],
@@ -894,13 +902,19 @@ class Bot:
             )
             return
 
-        dormant = find_dormant(users, active, passive, days)
+        if debug:
+            self._send_dormant_debug(chat_id, notice["message_id"], users, scan, days)
+            return
+
+        dormant = find_dormant(users, scan, days)
         blocked = [item for item in dormant if not item.enabled]
         idle = [item for item in dormant if item.enabled]
 
         lines = [
             self.org_prefix(chat_id) + f"<b>Неиспользуемые ящики за {days} дн.</b>",
             f"Всего сотрудников: {len(users)} · без активности: {len(dormant)}",
+            f"<i>Событий в журнале: {scan.events}, из них активных людей: "
+            f"{self._matched(users, scan)} из {len(users)}</i>",
             "",
         ]
         if idle:
@@ -924,7 +938,7 @@ class Bot:
         if len(dormant) > 20:
             lines.append("")
             lines.append("<i>Показаны первые 20, полный список — в файле.</i>")
-        if truncated:
+        if scan.truncated:
             lines.append("")
             lines.append(
                 "<i>⚠️ Журнал очень большой, просмотрена только часть. "
@@ -941,6 +955,45 @@ class Bot:
 
         if len(dormant) > 20:
             self._send_dormant_file(chat_id, org, dormant, days)
+
+    @staticmethod
+    def _matched(users: list[dict], scan) -> int:
+        """Сколько сотрудников из справочника нашлись в журнале как активные."""
+        return sum(
+            1 for user in users if any(key in scan.active for key in user_keys(user))
+        )
+
+    def _send_dormant_debug(
+        self, chat_id: int, message_id: int, users: list[dict], scan, days: int
+    ) -> None:
+        """Показывает, как журнал называет людей — чтобы поймать несовпадение."""
+        lines = [
+            f"<b>Отладка /dead за {days} дн.</b>",
+            f"Событий: {scan.events} · активных ключей: {len(scan.active)}",
+            f"Сотрудников: {len(users)} · опознано активными: "
+            f"{self._matched(users, scan)}",
+            "",
+            "<b>Первые события журнала</b>",
+        ]
+        for sample in scan.samples:
+            lines.append(
+                f"• uid=<code>{html.escape(str(sample.get('userUid')))}</code> "
+                f"login=<code>{html.escape(str(sample.get('userLogin')))}</code> "
+                f"{html.escape(str(sample.get('eventType')))} "
+                f"{str(sample.get('date'))[:19]}"
+            )
+        if not scan.samples:
+            lines.append("журнал пуст — либо период мал, либо нет прав на аудит-лог")
+
+        lines.append("")
+        lines.append("<b>Как выглядят сотрудники</b>")
+        for user in users[:3]:
+            keys = sorted(user_keys(user))[:4]
+            lines.append(
+                f"• <code>{html.escape(str(user.get('email', '')))}</code> → "
+                + ", ".join(f"<code>{html.escape(key)}</code>" for key in keys)
+            )
+        self.telegram.edit(chat_id, message_id, "\n".join(lines))
 
     def _send_dormant_file(self, chat_id: int, org: Org, dormant: list, days: int) -> None:
         fields = ["last", "first", "nickname", "email", "is_enabled", "created_at", "note"]
