@@ -40,6 +40,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="store_true", help="подробный лог")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    sub.add_parser(
+        "check", help="проверить токен и доступ к организации по шагам"
+    )
     sub.add_parser("orgs", help="настроенные организации и их ID")
     sub.add_parser("dept", help="список отделов")
 
@@ -100,6 +103,8 @@ def main(argv: list[str] | None = None) -> int:
         directory = registry.directory(args.org_key)
 
     try:
+        if args.command == "check":
+            return cmd_check(registry, directory, args)
         if args.command == "orgs":
             return cmd_orgs(registry, directory)
         if args.command == "dept":
@@ -117,6 +122,82 @@ def main(argv: list[str] | None = None) -> int:
         print("\nПрервано.")
         return 130
     return 0
+
+
+def cmd_check(registry: OrgRegistry, directory: Directory, args) -> int:
+    """Проверяет токен по шагам и говорит, что именно не так."""
+    import requests
+
+    org = registry.get(args.org_key)
+    token = org.token if not args.token else args.token
+
+    print("1) Формат токена")
+    if not token:
+        print("   ✗ токен пуст — заполните Y360_TOKEN в .env")
+        return 1
+    if not token.startswith("y0_"):
+        print(f"   ✗ начинается с «{token[:3]}», а должен с «y0_»")
+        print("     Похоже, скопирован не токен (например, ClientID или Client secret).")
+    elif len(token) < 40 or any(c in token for c in "&? \"'"):
+        print(f"   ✗ подозрительная строка: длина {len(token)}")
+        print("     Из адресной строки нужен только кусок между access_token= и &")
+    else:
+        print(f"   ✓ y0_… длина {len(token)}")
+
+    print("2) Чей это токен")
+    try:
+        response = requests.get(
+            "https://login.yandex.ru/info?format=json",
+            headers={"Authorization": f"OAuth {token}"},
+            timeout=30,
+        )
+        if response.status_code == 401:
+            print("   ✗ Яндекс не принял токен: недействителен, отозван или истёк")
+            print("     Выпустите заново: oauth.yandex.ru/authorize?response_type=token&client_id=…")
+            return 1
+        response.raise_for_status()
+        info = response.json()
+        print(f"   ✓ {info.get('login')} ({info.get('display_name', '')})")
+        print("     Это должен быть администратор организации.")
+    except requests.RequestException as exc:
+        print(f"   ? проверить не удалось: {exc}")
+
+    print("3) Список организаций (право directory:read_organization)")
+    org_ids = []
+    try:
+        available = directory.client.organizations()
+        for item in available:
+            org_ids.append(str(item.get("id")))
+            print(f"   ✓ {item.get('id')}\t{item.get('name')}")
+        if not available:
+            print("   ? токен не привязан ни к одной организации")
+    except ApiError as exc:
+        print(f"   ✗ {exc}")
+        print("     Права на чтение организаций нет — это не мешает работе бота.")
+        print("     ID организации возьмите в админке (параметр org= в адресной строке).")
+
+    print(f"4) Доступ к организации {org.org_id}")
+    if org_ids and org.org_id not in org_ids:
+        print(f"   ✗ в .env указан {org.org_id}, а токен видит: {', '.join(org_ids)}")
+        print("     Впишите в Y360_ORG_ID правильный ID.")
+        return 1
+    try:
+        departments = directory.departments(refresh=True)
+        print(f"   ✓ отделов: {len(departments)}")
+        users = directory.users(refresh=True)
+        print(f"   ✓ сотрудников: {len(users)}")
+        print("\nВсё готово: docker compose up -d --build")
+        return 0
+    except ApiError as exc:
+        print(f"   ✗ {exc}")
+        if exc.status == 401:
+            print("     Токен не принят: выпустите заново под администратором организации.")
+        elif exc.status == 403:
+            print("     Не выданы права directory:read_users / directory:read_departments,")
+            print("     либо токен получен не под администратором организации.")
+        elif exc.status == 404:
+            print(f"     Организации {org.org_id} не существует — проверьте Y360_ORG_ID.")
+        return 1
 
 
 def cmd_orgs(registry: OrgRegistry, directory: Directory) -> int:
