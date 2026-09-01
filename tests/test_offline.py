@@ -49,6 +49,40 @@ class FakeClient:
         return {"alias": alias}
 
 
+
+
+class _Recorder:
+    """Подменяет клиент Telegram: запоминает сообщения вместо отправки."""
+
+    def __init__(self, sink):
+        self.sink = sink
+
+    def send(self, chat_id, text, **kwargs):
+        self.sink.append({"text": text, "markup": kwargs.get("reply_markup")})
+        return {"message_id": len(self.sink)}
+
+    def edit(self, chat_id, message_id, text, **kwargs):
+        self.sink.append({"text": text, "markup": kwargs.get("reply_markup")})
+        return {"message_id": message_id}
+
+
+class _FakeDirectory:
+    """Только для проверки поиска двойников."""
+
+    @staticmethod
+    def users():
+        return [
+            {
+                "id": "1", "email": "ivan.ivanov@example.ru", "isEnabled": True,
+                "name": {"first": "Иван", "last": "Иванов"},
+            },
+            {
+                "id": "2", "email": "maria.petrova@example.ru", "isEnabled": True,
+                "name": {"first": "Мария", "last": "Петрова"},
+            },
+        ]
+
+
 def check(condition, message):
     if not condition:
         raise AssertionError(message)
@@ -384,6 +418,67 @@ def test_bot_wiring():
             for b in row
         ]
         check("🗑 Удалить" not in labels2, "без allow_delete кнопки удаления нет")
+
+        # настройки, заданные из бота, перекрывают .env
+        from y360.state import State as _State
+        org = instance.org_for(1)
+        check(instance.setting(org, "password_length") == 14, "длина пароля из .env")
+        instance.state.set_setting(org.key, "password_length", 20)
+        instance.state.set_setting(org.key, "nickname_pattern", "{f}.{last}")
+        check(instance.setting(org, "password_length") == 20, "настройка перекрыла .env")
+        check(instance.setting(org, "nickname_pattern") == "{f}.{last}", "шаблон логина")
+        check(
+            _State(instance.state.path).settings(org.key)["password_length"] == 20,
+            "настройки переживают перезапуск",
+        )
+
+        import bot as _bot
+        for field, (title, choices) in _bot.SETTINGS_CHOICES.items():
+            check(bool(title) and len(choices) >= 2, f"настройка «{title}» с выбором")
+
+        check(bool(_bot.LOOKS_LIKE_LOGIN.match("m.ivanov")), "логин распознан как поиск")
+        check(
+            bool(_bot.LOOKS_LIKE_LOGIN.match("m.ivanov@blagotrud.ru")),
+            "почта распознана как поиск",
+        )
+        check(
+            not _bot.LOOKS_LIKE_LOGIN.match("Иванов Максим"),
+            "ФИО не путается с логином",
+        )
+
+        # текст для сотрудника и меню настроек — что реально уходит в чат
+        sent: list[dict] = []
+        instance.telegram = _Recorder(sent)
+        instance.welcome["w1"] = {
+            "email": "m.ivanov@blagotrud.ru", "password": "+G528AQ-L*Rit#",
+            "name": "Максим", "change": True, "at": 0,
+        }
+        instance.send_welcome(1, "w1")
+        welcome = sent[-1]["text"]
+        check("Здравствуйте, Максим!" in welcome, "обращение по имени")
+        check("m.ivanov@blagotrud.ru" in welcome, "логин в тексте для сотрудника")
+        check("+G528AQ-L*Rit#" in welcome, "пароль в тексте")
+        check("mail.yandex.ru" in welcome, "ссылка на вход")
+        check("сменить пароль" in welcome, "напоминание про смену пароля")
+
+        instance.send_welcome(1, "нет-такого")
+        check("устарел" in sent[-1]["text"], "просроченный текст не падает")
+
+        instance.cmd_settings(1)
+        menu = sent[-1]
+        check("Настройки" in menu["text"], "меню настроек открывается")
+        check("20 символов" in menu["text"], "показана текущая длина пароля")
+        check(
+            len(menu["markup"]["inline_keyboard"]) == len(_bot.SETTINGS_CHOICES),
+            "кнопка на каждую настройку",
+        )
+
+        twins = _bot.Bot.find_twins(_FakeDirectory(), NewUser(first="Иван", last="Иванов"))
+        check(len(twins) == 1, "двойник найден по имени и фамилии")
+        check(
+            not _bot.Bot.find_twins(_FakeDirectory(), NewUser(first="Пётр", last="Иванов")),
+            "другое имя двойником не считается",
+        )
 
 
 def main():

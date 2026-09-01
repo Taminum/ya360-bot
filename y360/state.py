@@ -43,6 +43,15 @@ class State:
             self._data.setdefault("chat_org", {})[str(chat_id)] = org_key
             self._save()
 
+    # --- настройки, заданные из бота ---------------------------------------
+    def settings(self, org_key: str) -> dict:
+        return dict(self._data.get("settings", {}).get(org_key, {}))
+
+    def set_setting(self, org_key: str, name: str, value) -> None:
+        with self._lock:
+            self._data.setdefault("settings", {}).setdefault(org_key, {})[name] = value
+            self._save()
+
     # --- архив счетов ------------------------------------------------------
     def add_invoice(self, org_key: str, record: dict) -> None:
         with self._lock:

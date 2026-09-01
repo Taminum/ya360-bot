@@ -40,6 +40,8 @@ HELP = """<b>Что умею</b>
 /find Иванов — карточка сотрудника: блокировка, сброс пароля, удаление
 /dept — отделы с их ID
 /export — все сотрудники таблицей
+/last — кого заводили последними
+/settings — длина пароля, шаблон логина и прочее
 /org — выбрать организацию
 /bill — оплата и архив счетов
 /id — ваш Telegram ID
@@ -56,6 +58,33 @@ _VAULT_WARNING = (
     "\n⚠️ Пароль не сохранён в архив: нет прав на запись в data/.\n"
     "На сервере: <code>sudo chown -R 10001:10001 data</code>"
 )
+
+SETTINGS_CHOICES = {
+    "password_length": ("Длина пароля", [
+        ("10 символов", 10), ("12 символов", 12), ("14 символов", 14),
+        ("16 символов", 16), ("20 символов", 20),
+    ]),
+    "password_change_required": ("Смена пароля при первом входе", [
+        ("требовать", True), ("не требовать", False),
+    ]),
+    "nickname_pattern": ("Шаблон логина", [
+        ("i.ivanov", "{f}.{last}"), ("ivan.ivanov", "{first}.{last}"),
+        ("iivanov", "{f}{last}"), ("ivanov", "{last}"),
+    ]),
+    "translit": ("Транслитерация", [
+        ("Барысхан -> baryshan", "simple"), ("Барысхан -> baryskhan", "passport"),
+    ]),
+    "name_order": ("Порядок слов в ФИО", [
+        ("Фамилия Имя", "last_first"), ("Имя Фамилия", "first_last"),
+    ]),
+    "auto_delete": ("Удалять пароль из чата", [
+        ("не удалять", 0), ("через 1 минуту", 60),
+        ("через 5 минут", 300), ("через 15 минут", 900),
+    ]),
+}
+
+# «m.ivanov» или «m.ivanov@company.ru» — это поиск, а не новый сотрудник
+LOOKS_LIKE_LOGIN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(@[A-Za-z0-9.-]+)?$")
 
 DELETE_PHRASE = re.compile(r"^\s*удалить\s+(\S+)\s*$", re.IGNORECASE)
 
@@ -85,6 +114,7 @@ class Bot:
             os.environ.get("BOT_INVOICES_DIR", str(data_dir() / "invoices"))
         )
         self.pending: dict[str, dict] = {}
+        self.welcome: dict[str, dict] = {}
         self.pending_delete: dict[int, dict] = {}
         self.to_delete: list[tuple[int, int, float]] = []
         self._counter = 0
@@ -107,6 +137,23 @@ class Bot:
 
     def directory_for(self, chat_id: int) -> Directory:
         return self.registry.directory(self.org_for(chat_id).key)
+
+    def setting(self, org: Org, name: str):
+        """Значение настройки: сначала заданное из бота, потом из .env."""
+        overrides = self.state.settings(org.key)
+        if name in overrides:
+            return overrides[name]
+        return {
+            "password_length": org.password_length,
+            "nickname_pattern": org.nickname_pattern,
+            "translit": org.translit,
+            "password_change_required": org.password_change_required,
+            "name_order": self.name_order,
+            "auto_delete": self.auto_delete,
+        }[name]
+
+    def delay_for(self, chat_id: int) -> int:
+        return int(self.setting(self.org_for(chat_id), "auto_delete") or 0)
 
     def help_text(self) -> str:
         """Примеры в справке — в том порядке ФИО, который настроен."""
@@ -139,6 +186,8 @@ class Bot:
             ("find", "Найти сотрудника"),
             ("dept", "Список отделов"),
             ("export", "Выгрузить всех в таблицу"),
+            ("last", "Последние заведённые"),
+            ("settings", "Настройки"),
             ("org", "Выбрать организацию"),
             ("bill", "Оплата и счета"),
             ("help", "Справка"),
@@ -185,6 +234,10 @@ class Bot:
             self.cmd_departments(chat_id)
         elif text.startswith("/export"):
             self.cmd_export(chat_id)
+        elif text.startswith("/settings") or text.startswith("/set"):
+            self.cmd_settings(chat_id)
+        elif text.startswith("/last"):
+            self.cmd_last(chat_id)
         elif text.startswith("/find"):
             self.cmd_find(chat_id, text[len("/find"):].strip())
         elif text.startswith("/bill"):
@@ -193,6 +246,8 @@ class Bot:
             self.telegram.send(chat_id, "Неизвестная команда. /help")
         elif DELETE_PHRASE.match(text):
             self.confirm_delete(chat_id, sender, DELETE_PHRASE.match(text).group(1))
+        elif LOOKS_LIKE_LOGIN.match(text):
+            self.cmd_find(chat_id, text.split('@')[0])
         else:
             self.propose_user(chat_id, text)
 
@@ -353,7 +408,7 @@ class Bot:
         org = self.org_for(chat_id)
         directory = self.directory_for(chat_id)
         try:
-            new_user = self.parse_input(text, self.name_order)
+            new_user = self.parse_input(text, self.setting(org, "name_order"))
         except ValueError as exc:
             self.telegram.send(chat_id, f"{html.escape(str(exc))}\n\n{HELP}")
             return
@@ -373,14 +428,16 @@ class Bot:
 
         new_user.department_id = department_id
         new_user.department_name = department_name
-        new_user.password_change_required = org.password_change_required
+        new_user.password_change_required = bool(
+            self.setting(org, "password_change_required")
+        )
 
         try:
             directory.prepare(
                 new_user,
-                nickname_pattern=org.nickname_pattern,
-                password_length=org.password_length,
-                translit_style=org.translit,
+                nickname_pattern=self.setting(org, "nickname_pattern"),
+                password_length=int(self.setting(org, "password_length")),
+                translit_style=self.setting(org, "translit"),
             )
         except ApiError as exc:
             self.telegram.send(chat_id, _api_error(exc))
@@ -406,6 +463,17 @@ class Bot:
             preview.append(f"Должность: {html.escape(new_user.position)}")
         if new_user.phone:
             preview.append(f"Телефон: {html.escape(new_user.phone)}")
+
+        twins = self.find_twins(directory, new_user)
+        if twins:
+            preview.append("")
+            preview.append("⚠️ <b>Такой сотрудник уже есть:</b>")
+            for twin in twins[:3]:
+                status = "" if twin.get("isEnabled", True) else " (заблокирован)"
+                preview.append(
+                    f"• {html.escape(_full_name(twin))} — "
+                    f"<code>{html.escape(str(twin.get('email', '')))}</code>{status}"
+                )
         preview.append("\nСоздать сотрудника?")
 
         self.telegram.send(
@@ -441,15 +509,15 @@ class Bot:
         lines = [
             f"✅ <b>{html.escape(_join(new_user.last, new_user.first, new_user.middle))}</b>",
             "",
-            f"Почта: <code>{html.escape(email)}</code>",
+            f"Логин: <code>{html.escape(email)}</code>",
             f"Пароль: <code>{html.escape(new_user.password)}</code>",
+            "Вход через яндекс почту",
         ]
-        if new_user.password_change_required:
-            lines.append("\n<i>Пароль нужно сменить при первом входе.</i>")
         for error in created.get("_alias_errors", []):
             lines.append(f"⚠️ алиас не добавлен — {html.escape(error)}")
-        if self.auto_delete:
-            lines.append(f"<i>Сообщение удалится через {self.auto_delete} с.</i>")
+        delay = self.delay_for(chat_id)
+        if delay:
+            lines.append(f"<i>Сообщение удалится через {delay} с.</i>")
 
         saved = self.vault.save(
             org.key, new_user.nickname, new_user.password,
@@ -458,10 +526,27 @@ class Bot:
         if self.vault.enabled and not saved:
             lines.append(_VAULT_WARNING)
 
-        self.telegram.edit(chat_id, message_id, "\n".join(lines))
+        # текст для пересылки сотруднику готовим заранее — пароль больше нигде не хранится
+        self._counter += 1
+        welcome_key = f"w{self._counter}"
+        self.welcome[welcome_key] = {
+            "email": email,
+            "password": new_user.password,
+            "name": _join(new_user.first, new_user.middle),
+            "change": bool(new_user.password_change_required),
+            "at": time.time(),
+        }
+
+        self.telegram.edit(
+            chat_id, message_id, "\n".join(lines),
+            reply_markup={"inline_keyboard": [[{
+                "text": "📋 Текст для сотрудника",
+                "callback_data": f"wel:{welcome_key}",
+            }]]},
+        )
         self._audit(org, "create", new_user, email, sender, "ok", "")
-        if self.auto_delete:
-            self.to_delete.append((chat_id, message_id, time.time() + self.auto_delete))
+        if delay:
+            self.to_delete.append((chat_id, message_id, time.time() + delay))
 
     # --- блокировка, пароль, удаление -------------------------------------------
     def do_block(
@@ -493,10 +578,10 @@ class Bot:
         org = self.org_for(chat_id)
         directory = self.directory_for(chat_id)
         user = directory.user_by_id(user_id) or {}
-        password = generate_password(org.password_length)
+        password = generate_password(int(self.setting(org, "password_length")))
         try:
             directory.client.set_password(
-                user_id, password, org.password_change_required
+                user_id, password, bool(self.setting(org, "password_change_required"))
             )
         except ApiError as exc:
             self._audit_user(org, "password", user, sender, "error", str(exc))
@@ -517,14 +602,15 @@ class Bot:
             f"Почта: <code>{html.escape(str(user.get('email', '')))}</code>",
             f"Новый пароль: <code>{html.escape(password)}</code>",
         ]
-        if org.password_change_required:
-            lines.append("\n<i>Сменить при первом входе.</i>")
+        if self.setting(org, "password_change_required"):
+            lines.append("<i>Сменить при первом входе.</i>")
         if self.vault.enabled and not saved:
             lines.append(_VAULT_WARNING)
         sent = self.telegram.send(chat_id, "\n".join(lines))
-        if self.auto_delete:
+        delay = self.delay_for(chat_id)
+        if delay:
             self.to_delete.append(
-                (chat_id, sent["message_id"], time.time() + self.auto_delete)
+                (chat_id, sent["message_id"], time.time() + delay)
             )
         _ = message_id
 
@@ -548,9 +634,10 @@ class Bot:
             f"<i>выдан {issued}</i>",
         ]
         sent = self.telegram.send(chat_id, "\n".join(lines))
-        if self.auto_delete:
+        delay = self.delay_for(chat_id)
+        if delay:
             self.to_delete.append(
-                (chat_id, sent["message_id"], time.time() + self.auto_delete)
+                (chat_id, sent["message_id"], time.time() + delay)
             )
 
     def cmd_export(self, chat_id: int) -> None:
@@ -623,6 +710,128 @@ class Bot:
             caption += ", включая выданные пароли"
         self.telegram.upload_document(chat_id, str(path), caption)
         self.telegram.delete(chat_id, notice["message_id"])
+
+    @staticmethod
+    def find_twins(directory: Directory, new_user: NewUser) -> list[dict]:
+        """Однофамильцы с тем же именем — чтобы не завести человека дважды."""
+        first = new_user.first.strip().lower()
+        last = new_user.last.strip().lower()
+        twins = []
+        for user in directory.users():
+            name = user.get("name") or {}
+            if (
+                str(name.get("first", "")).strip().lower() == first
+                and str(name.get("last", "")).strip().lower() == last
+            ):
+                twins.append(user)
+        return twins
+
+    # --- настройки прямо в боте --------------------------------------------
+    def cmd_settings(self, chat_id: int, message_id: int | None = None) -> None:
+        org = self.org_for(chat_id)
+        lines = [self.org_prefix(chat_id) + "<b>Настройки</b>", ""]
+        buttons = []
+        for field, (title, choices) in SETTINGS_CHOICES.items():
+            current = self.setting(org, field)
+            label = next(
+                (name for name, value in choices if value == current), str(current)
+            )
+            lines.append(f"{title}: <b>{html.escape(label)}</b>")
+            buttons.append([{"text": title, "callback_data": f"cfg:{field}"}])
+        lines.append("")
+        lines.append("<i>Действуют для текущей организации и переживают перезапуск.</i>")
+
+        markup = {"inline_keyboard": buttons}
+        text = "\n".join(lines)
+        if message_id:
+            self.telegram.edit(chat_id, message_id, text, reply_markup=markup)
+        else:
+            self.telegram.send(chat_id, text, reply_markup=markup)
+
+    def show_setting_choices(self, chat_id: int, message_id: int, field: str) -> None:
+        if field not in SETTINGS_CHOICES:
+            return
+        org = self.org_for(chat_id)
+        title, choices = SETTINGS_CHOICES[field]
+        current = self.setting(org, field)
+        buttons = [
+            [{
+                "text": ("✅ " if value == current else "") + name,
+                "callback_data": f"cfgs:{field}:{index}",
+            }]
+            for index, (name, value) in enumerate(choices)
+        ]
+        buttons.append([{"text": "‹ Назад", "callback_data": "cfg:back"}])
+        self.telegram.edit(
+            chat_id, message_id, f"<b>{title}</b>",
+            reply_markup={"inline_keyboard": buttons},
+        )
+
+    def apply_setting(
+        self, chat_id: int, message_id: int, field: str, index: str
+    ) -> None:
+        if field not in SETTINGS_CHOICES or not index.isdigit():
+            return
+        _, choices = SETTINGS_CHOICES[field]
+        position = int(index)
+        if position >= len(choices):
+            return
+        self.state.set_setting(self.org_for(chat_id).key, field, choices[position][1])
+        self.cmd_settings(chat_id, message_id)
+
+    # --- готовый текст для сотрудника ---------------------------------------
+    def send_welcome(self, chat_id: int, key: str) -> None:
+        entry = self.welcome.get(key)
+        if not entry:
+            self.telegram.send(
+                chat_id, "Текст устарел — пароль можно выдать заново в карточке."
+            )
+            return
+        greeting = f"Здравствуйте, {entry['name']}!" if entry["name"] else "Здравствуйте!"
+        lines = [
+            greeting,
+            "",
+            "Ваша рабочая почта готова.",
+            f"Логин: <code>{html.escape(entry['email'])}</code>",
+            f"Пароль: <code>{html.escape(entry['password'])}</code>",
+            "",
+            "Вход через Яндекс Почту: https://mail.yandex.ru",
+        ]
+        if entry["change"]:
+            lines.append("При первом входе система попросит сменить пароль.")
+        self.telegram.send(chat_id, "\n".join(lines))
+
+    # --- последние заведённые -----------------------------------------------
+    def cmd_last(self, chat_id: int, limit: int = 10) -> None:
+        org = self.org_for(chat_id)
+        if not self.audit_path.exists():
+            self.telegram.send(chat_id, "Журнал пока пуст.")
+            return
+        try:
+            rows = read_rows(self.audit_path)
+        except OSError as exc:
+            self.telegram.send(chat_id, f"Журнал не читается: {html.escape(str(exc))}")
+            return
+
+        created = [
+            row for row in rows
+            if row.get("action") == "create"
+            and row.get("status") == "ok"
+            and (len(self.registry) < 2 or row.get("org") == org.title)
+        ]
+        if not created:
+            self.telegram.send(chat_id, "Через бота ещё никого не заводили.")
+            return
+
+        lines = [self.org_prefix(chat_id) + f"<b>Последние {min(limit, len(created))}</b>"]
+        for row in reversed(created[-limit:]):
+            when = str(row.get("at", ""))[:10]
+            name = _join(row.get("last"), row.get("first"))
+            lines.append(
+                f"{when} — {html.escape(name)} "
+                f"<code>{html.escape(str(row.get('email', '')))}</code>"
+            )
+        self.telegram.send(chat_id, "\n".join(lines))
 
     def ask_delete(self, chat_id: int, user_id: str) -> None:
         org = self.org_for(chat_id)
@@ -801,6 +1010,16 @@ class Bot:
             self.do_password(chat_id, message_id, sender, payload)
         elif action == "pv":
             self.show_saved_password(chat_id, payload)
+        elif action == "wel":
+            self.send_welcome(chat_id, payload)
+        elif action == "cfg":
+            if payload == "back":
+                self.cmd_settings(chat_id, message_id)
+            else:
+                self.show_setting_choices(chat_id, message_id, payload)
+        elif action == "cfgs":
+            field, _, index = payload.partition(":")
+            self.apply_setting(chat_id, message_id, field, index)
         elif action == "del":
             self.ask_delete(chat_id, payload)
         elif action == "inv":
