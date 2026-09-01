@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import time
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,6 +42,8 @@ HELP = """<b>Что умею</b>
 /dept — отделы с их ID
 /export — все сотрудники таблицей
 /last — кого заводили последними
+/journal — весь журнал файлом
+/backup — прислать копию данных бота
 /settings — длина пароля, шаблон логина и прочее
 /org — выбрать организацию
 /bill — оплата и архив счетов
@@ -58,6 +61,25 @@ _VAULT_WARNING = (
     "\n⚠️ Пароль не сохранён в архив: нет прав на запись в data/.\n"
     "На сервере: <code>sudo chown -R 10001:10001 data</code>"
 )
+
+MENU = {
+    "🔍 Найти": "find",
+    "📊 Выгрузка": "export",
+    "🕘 Последние": "last",
+    "⚙️ Настройки": "settings",
+    "💳 Счета": "bill",
+    "🏢 Отделы": "dept",
+}
+
+KEYBOARD = {
+    "keyboard": [
+        [{"text": "🔍 Найти"}, {"text": "📊 Выгрузка"}],
+        [{"text": "🕘 Последние"}, {"text": "🏢 Отделы"}],
+        [{"text": "💳 Счета"}, {"text": "⚙️ Настройки"}],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
 
 SETTINGS_CHOICES = {
     "password_length": ("Длина пароля", [
@@ -110,6 +132,7 @@ class Bot:
         self.audit_path = Path(
             os.environ.get("BOT_AUDIT_FILE", str(data_dir() / "journal.csv"))
         )
+        self.backup_days = int(os.environ.get("BOT_BACKUP_DAYS", "0") or 0)
         self.invoices_dir = Path(
             os.environ.get("BOT_INVOICES_DIR", str(data_dir() / "invoices"))
         )
@@ -188,6 +211,8 @@ class Bot:
             ("export", "Выгрузить всех в таблицу"),
             ("last", "Последние заведённые"),
             ("settings", "Настройки"),
+            ("journal", "Журнал файлом"),
+            ("backup", "Копия данных"),
             ("org", "Выбрать организацию"),
             ("bill", "Оплата и счета"),
             ("help", "Справка"),
@@ -200,6 +225,7 @@ class Bot:
                 log.exception("Ошибка обработки обновления")
                 self._report_error(update, exc)
             self._process_deletions()
+            self.maybe_auto_backup()
 
     def handle(self, update: dict) -> None:
         if "callback_query" in update:
@@ -220,14 +246,22 @@ class Bot:
         if not self._authorized(chat_id, sender):
             return
 
+        self.state.remember("last_chat", chat_id)
+
         if message.get("document"):
             self.save_invoice(chat_id, sender, message)
             return
         if not text:
             return
 
+        if text in MENU:  # нажата кнопка нижней клавиатуры
+            text = "/" + MENU[text]
+
         if text.startswith("/help"):
-            self.telegram.send(chat_id, self.org_prefix(chat_id) + self.help_text())
+            self.telegram.send(
+                chat_id, self.org_prefix(chat_id) + self.help_text(),
+                reply_markup=KEYBOARD,
+            )
         elif text.startswith("/org"):
             self.cmd_orgs(chat_id)
         elif text.startswith("/dept"):
@@ -242,12 +276,17 @@ class Bot:
             self.cmd_find(chat_id, text[len("/find"):].strip())
         elif text.startswith("/bill"):
             self.cmd_bill(chat_id)
+        elif text.startswith("/backup"):
+            self.cmd_backup(chat_id)
+        elif text.startswith("/journal"):
+            self.cmd_journal(chat_id)
         elif text.startswith("/"):
             self.telegram.send(chat_id, "Неизвестная команда. /help")
         elif DELETE_PHRASE.match(text):
             self.confirm_delete(chat_id, sender, DELETE_PHRASE.match(text).group(1))
-        elif LOOKS_LIKE_LOGIN.match(text):
-            self.cmd_find(chat_id, text.split('@')[0])
+        elif len(text.split()) == 1:
+            # одно слово — это поиск: и «m.ivanov», и «Иванов»
+            self.cmd_find(chat_id, text.split("@")[0])
         else:
             self.propose_user(chat_id, text)
 
@@ -316,7 +355,10 @@ class Bot:
     # --- поиск и карточка сотрудника -----------------------------------------
     def cmd_find(self, chat_id: int, query: str) -> None:
         if not query:
-            self.telegram.send(chat_id, "Например: <code>/find Иванов</code>")
+            self.telegram.send(
+                chat_id,
+                "Отправьте фамилию, логин или почту — покажу карточку.",
+            )
             return
         try:
             found = self.directory_for(chat_id).find_users(query, limit=12)
@@ -413,9 +455,14 @@ class Bot:
             self.telegram.send(chat_id, f"{html.escape(str(exc))}\n\n{HELP}")
             return
 
+        # отдел не указан — берём тот же, что и в прошлый раз
+        asked = new_user.department_name
+        remembered = "" if asked else str(
+            self.state.recall(f"department:{org.key}", "") or ""
+        )
         try:
             department_id, department_name = directory.resolve_department(
-                new_user.department_name or org.default_department
+                asked or remembered or org.default_department
             )
         except ValueError as exc:
             self.telegram.send(
@@ -457,7 +504,8 @@ class Bot:
             + f"<b>{html.escape(_join(new_user.last, new_user.first, new_user.middle))}</b>",
             f"Логин: <code>{html.escape(new_user.nickname)}</code>"
             + (f"@{html.escape(org.domain)}" if org.domain else ""),
-            f"Отдел: {html.escape(new_user.department_name or str(department_id))}",
+            f"Отдел: {html.escape(new_user.department_name or str(department_id))}"
+            + ("  <i>(как в прошлый раз)</i>" if remembered and not asked else ""),
         ]
         if new_user.position:
             preview.append(f"Должность: {html.escape(new_user.position)}")
@@ -537,12 +585,23 @@ class Bot:
             "at": time.time(),
         }
 
+        buttons = [[{
+            "text": "📋 Текст для сотрудника",
+            "callback_data": f"wel:{welcome_key}",
+        }]]
+        if org.allow_delete and created.get("id"):
+            # опечатку в ФИО видно сразу — не заставляем идти через /find
+            buttons.append(
+                [{"text": "🗑 Удалить", "callback_data": f"del:{created['id']}"}]
+            )
+
         self.telegram.edit(
             chat_id, message_id, "\n".join(lines),
-            reply_markup={"inline_keyboard": [[{
-                "text": "📋 Текст для сотрудника",
-                "callback_data": f"wel:{welcome_key}",
-            }]]},
+            reply_markup={"inline_keyboard": buttons},
+        )
+        self.state.remember(
+            f"department:{org.key}",
+            new_user.department_name or new_user.department_id,
         )
         self._audit(org, "create", new_user, email, sender, "ok", "")
         if delay:
@@ -800,6 +859,66 @@ class Bot:
         if entry["change"]:
             lines.append("При первом входе система попросит сменить пароль.")
         self.telegram.send(chat_id, "\n".join(lines))
+
+    # --- копия данных и журнал ------------------------------------------------
+    def cmd_backup(self, chat_id: int, quiet: bool = False) -> None:
+        """Журнал, пароли, настройки и архив счетов — одним архивом в чат."""
+        root = data_dir()
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        archive = root / "backups" / f"ya360_{stamp}.zip"
+        archive.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+                for path in sorted(root.rglob("*")):
+                    if path.is_file() and "backups" not in path.parts:
+                        bundle.write(path, path.relative_to(root))
+        except OSError as exc:
+            self.telegram.send(
+                chat_id, f"Не собрал архив: <code>{html.escape(str(exc))}</code>"
+            )
+            return
+
+        size = archive.stat().st_size
+        if size <= 32:  # пустой zip — данных ещё нет
+            archive.unlink(missing_ok=True)
+            if not quiet:
+                self.telegram.send(chat_id, "Сохранять пока нечего — данных нет.")
+            return
+
+        caption = (
+            f"Копия данных бота от {stamp.replace('_', ' ')}"
+            + (" (по расписанию)" if quiet else "")
+        )
+        if self.vault.enabled:
+            caption += "\n⚠️ Внутри пароли сотрудников — храните бережно."
+        self.telegram.upload_document(chat_id, str(archive), caption)
+        self.state.remember("last_backup", time.time())
+        archive.unlink(missing_ok=True)  # на сервере копию не держим
+
+    def cmd_journal(self, chat_id: int) -> None:
+        if not self.audit_path.exists():
+            self.telegram.send(chat_id, "Журнал пока пуст.")
+            return
+        self.telegram.upload_document(
+            chat_id, str(self.audit_path), "Журнал операций (открывается в Excel)"
+        )
+
+    def maybe_auto_backup(self) -> None:
+        """Раз в BOT_BACKUP_DAYS суток шлёт копию в последний активный чат."""
+        if not self.backup_days:
+            return
+        last = float(self.state.recall("last_backup", 0) or 0)
+        if time.time() - last < self.backup_days * 86400:
+            return
+        chat_id = self.state.recall("last_chat")
+        if not chat_id:
+            return
+        try:
+            self.cmd_backup(int(chat_id), quiet=True)
+        except (TelegramError, OSError):
+            log.exception("Не отправил копию по расписанию")
+            self.state.remember("last_backup", time.time())  # не долбим каждую секунду
 
     # --- последние заведённые -----------------------------------------------
     def cmd_last(self, chat_id: int, limit: int = 10) -> None:
@@ -1161,6 +1280,21 @@ def _who(sender: dict) -> str:
 
 
 def _api_error(exc: ApiError) -> str:
+    if exc.status == 401:
+        return (
+            "🔑 <b>Токен Яндекса больше не принимается.</b>\n"
+            "Он живёт около года — похоже, истёк или отозван.\n\n"
+            "Выпустите новый под администратором организации:\n"
+            "oauth.yandex.ru/authorize?response_type=token&amp;client_id=ВАШ_CLIENT_ID\n"
+            "и впишите в <code>.env</code> в строку <code>Y360_TOKEN</code>, "
+            "затем <code>docker compose up -d</code>."
+        )
+    if exc.status == 403:
+        return (
+            "🚫 Яндекс отказал в доступе. Проверьте, что токен выдан "
+            "администратору организации и приложению выданы права "
+            "<code>directory:write_users</code>."
+        )
     return f"Ошибка API: <code>{html.escape(str(exc))}</code>"
 
 

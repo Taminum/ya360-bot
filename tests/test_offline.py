@@ -65,6 +65,10 @@ class _Recorder:
         self.sink.append({"text": text, "markup": kwargs.get("reply_markup")})
         return {"message_id": message_id}
 
+    def upload_document(self, chat_id, path, caption=""):
+        self.sink.append({"file": path, "text": caption})
+        return {"message_id": len(self.sink)}
+
 
 class _FakeDirectory:
     """Только для проверки поиска двойников."""
@@ -472,6 +476,48 @@ def test_bot_wiring():
             len(menu["markup"]["inline_keyboard"]) == len(_bot.SETTINGS_CHOICES),
             "кнопка на каждую настройку",
         )
+
+        # маршрутизация: кнопка нижней клавиатуры и поиск одним словом
+        instance.registry._directories[org.key] = Directory(FakeClient())
+        allowed_sender = {"id": 111, "username": "admin"}
+
+        instance.on_message({
+            "chat": {"id": 1}, "from": allowed_sender, "text": "🕘 Последние",
+        })
+        check("Журнал" in sent[-1]["text"], "кнопка «Последние» вызывает /last")
+
+        instance.on_message({
+            "chat": {"id": 1}, "from": allowed_sender, "text": "Иванов",
+        })
+        check(
+            "ivan.ivanov@example.ru" in sent[-1]["text"],
+            "одно слово кириллицей — это поиск, а не заведение",
+        )
+
+        instance.on_message({
+            "chat": {"id": 1}, "from": allowed_sender, "text": "ivan.ivanov",
+        })
+        check(
+            "ivan.ivanov@example.ru" in sent[-1]["text"], "поиск по логину работает"
+        )
+
+        # копия данных: архив собирается и уходит файлом
+        (Path(tmp) / "journal.csv").write_text(
+            "at;org;action\n2026-09-01;ООО;create\n", encoding="utf-8"
+        )
+        instance.cmd_backup(1)
+        backup = sent[-1]
+        check("file" in backup, "копия ушла файлом")
+        # файл удаляется после отправки, поэтому проверяем во время сборки
+        check("Копия данных" in backup["text"], "подпись у копии")
+
+        # понятное сообщение вместо голого 401
+        from y360.api import ApiError
+        expired = _bot._api_error(ApiError("GET", "/u", 401, "Не авторизован"))
+        check("Токен Яндекса" in expired, "401 объясняется по-человечески")
+        check("oauth.yandex.ru" in expired, "и подсказывает, где выпустить новый")
+        forbidden = _bot._api_error(ApiError("GET", "/u", 403, "нет прав"))
+        check("directory:write_users" in forbidden, "403 подсказывает про права")
 
         twins = _bot.Bot.find_twins(_FakeDirectory(), NewUser(first="Иван", last="Иванов"))
         check(len(twins) == 1, "двойник найден по имени и фамилии")

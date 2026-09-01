@@ -52,6 +52,15 @@ class State:
             self._data.setdefault("settings", {}).setdefault(org_key, {})[name] = value
             self._save()
 
+    # --- мелочи, которые бот помнит ------------------------------------------
+    def remember(self, name: str, value) -> None:
+        with self._lock:
+            self._data.setdefault("memory", {})[name] = value
+            self._save()
+
+    def recall(self, name: str, default=None):
+        return self._data.get("memory", {}).get(name, default)
+
     # --- архив счетов ------------------------------------------------------
     def add_invoice(self, org_key: str, record: dict) -> None:
         with self._lock:
