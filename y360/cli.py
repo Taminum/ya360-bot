@@ -135,6 +135,12 @@ def cmd_check(registry: OrgRegistry, directory: Directory, args) -> int:
     if not token:
         print("   ✗ токен пуст — заполните Y360_TOKEN в .env")
         return 1
+    if "..." in token or token.startswith("y0_AgAAAAA"):
+        print("   ✗ это заглушка из .env.example, а не ваш токен")
+        print("     Похоже, .env не сохранён или отредактирован не тот файл.")
+        print("     Проверьте: grep -n '^Y360_TOKEN' .env")
+        _warn_duplicate_keys()
+        return 1
     if not token.startswith("y0_"):
         print(f"   ✗ начинается с «{token[:3]}», а должен с «y0_»")
         print("     Похоже, скопирован не токен (например, ClientID или Client secret).")
@@ -198,6 +204,25 @@ def cmd_check(registry: OrgRegistry, directory: Directory, args) -> int:
         elif exc.status == 404:
             print(f"     Организации {org.org_id} не существует — проверьте Y360_ORG_ID.")
         return 1
+
+
+def _warn_duplicate_keys(path: str = ".env") -> None:
+    """Две строки с одним ключом — частая причина «я же вставил токен»."""
+    from pathlib import Path as _Path
+
+    file = _Path(path)
+    if not file.exists():
+        print(f"     Файла {path} рядом с docker-compose.yml нет.")
+        return
+    counts: dict[str, int] = {}
+    for line in file.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key = line.split("=", 1)[0].strip()
+            counts[key] = counts.get(key, 0) + 1
+    doubled = [key for key, count in counts.items() if count > 1]
+    if doubled:
+        print(f"     В {path} по два раза заданы: {', '.join(doubled)} — оставьте по одной строке.")
 
 
 def cmd_orgs(registry: OrgRegistry, directory: Directory) -> int:
