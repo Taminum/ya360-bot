@@ -19,6 +19,7 @@ from pathlib import Path
 from y360.activity import (
     AuditUnavailable,
     collect_activity,
+    fill_traffic_dates,
     find_dormant,
     user_keys,
 )
@@ -912,6 +913,7 @@ class Bot:
             return
 
         dormant = find_dormant(users, scan, days)
+        fill_traffic_dates(directory.client, scan, dormant)
         blocked = [item for item in dormant if not item.enabled]
         idle = [item for item in dormant if item.enabled]
 
@@ -926,10 +928,9 @@ class Bot:
         if idle:
             lines.append(f"<b>Активны, но не пользуются ({len(idle)})</b>")
             for item in idle[:20]:
-                mark = " · письма приходят" if item.received_only else ""
                 lines.append(
                     f"• {html.escape(item.full_name)} — "
-                    f"<code>{html.escape(item.email)}</code>{mark}"
+                    f"<code>{html.escape(item.email)}</code>{_traffic(item)}"
                 )
         if blocked:
             lines.append("")
@@ -937,7 +938,7 @@ class Bot:
             for item in blocked[:20]:
                 lines.append(
                     f"• {html.escape(item.full_name)} — "
-                    f"<code>{html.escape(item.email)}</code>"
+                    f"<code>{html.escape(item.email)}</code>{_traffic(item)}"
                 )
         if not dormant:
             lines.append("Все пользуются почтой — лишних ящиков нет.")
@@ -959,7 +960,7 @@ class Bot:
 
         self.telegram.edit(chat_id, notice["message_id"], "\n".join(lines))
 
-        if len(dormant) > 20:
+        if dormant:
             self._send_dormant_file(chat_id, org, dormant, days)
 
     @staticmethod
@@ -1003,13 +1004,18 @@ class Bot:
         self.telegram.edit(chat_id, message_id, "\n".join(lines))
 
     def _send_dormant_file(self, chat_id: int, org: Org, dormant: list, days: int) -> None:
-        fields = ["last", "first", "nickname", "email", "is_enabled", "created_at", "note"]
+        fields = [
+            "last", "first", "nickname", "email", "is_enabled",
+            "last_incoming", "last_outgoing", "created_at", "note",
+        ]
         rows = [{
             "last": (item.user.get("name") or {}).get("last", ""),
             "first": (item.user.get("name") or {}).get("first", ""),
             "nickname": item.user.get("nickname", ""),
             "email": item.email,
             "is_enabled": "да" if item.enabled else "нет",
+            "last_incoming": _date(item.last_incoming),
+            "last_outgoing": _date(item.last_outgoing),
             "created_at": item.created,
             "note": "письма приходят, но не читаются" if item.received_only else "",
         } for item in dormant]
@@ -1454,6 +1460,23 @@ def _full_name(user: dict) -> str:
 
 def _join(*parts) -> str:
     return " ".join(str(part) for part in parts if part)
+
+
+def _traffic(item) -> str:
+    """Хвост строки: когда последний раз приходило и уходило письмо."""
+    parts = []
+    if item.last_incoming:
+        parts.append(f"вх. {_date(item.last_incoming)}")
+    if item.last_outgoing:
+        parts.append(f"исх. {_date(item.last_outgoing)}")
+    if not parts and item.received_only:
+        parts.append("письма приходят")
+    return f" · {chr(183).join(parts)}" if parts else ""
+
+
+def _date(moment) -> str:
+    """Дата для таблицы; пусто — если событий не нашлось."""
+    return moment.astimezone().strftime("%Y-%m-%d") if moment else ""
 
 
 def _now() -> str:

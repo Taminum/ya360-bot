@@ -9,7 +9,12 @@ from datetime import datetime
 from .api import ApiError, Y360Client
 from .config import load_env
 from .csvio import GENDER_ALIASES, read_rows, write_rows
-from .activity import AuditUnavailable, collect_activity, find_dormant
+from .activity import (
+    AuditUnavailable,
+    collect_activity,
+    fill_traffic_dates,
+    find_dormant,
+)
 from .orgs import OrgRegistry
 from .service import Directory, NewUser
 from . import xlsx
@@ -321,6 +326,7 @@ def cmd_dormant(directory: Directory, args) -> int:
         )
         return 1
     dormant = find_dormant(users, scan, days)
+    fill_traffic_dates(directory.client, scan, dormant)
 
     print(
         f"Сотрудников: {len(users)}, событий в журнале: {scan.events}, "
@@ -331,19 +337,27 @@ def cmd_dormant(directory: Directory, args) -> int:
         print("Пример события:", scan.samples[0])
     for item in dormant:
         status = "активен" if item.enabled else "заблокирован"
-        note = ", письма приходят" if item.received_only else ""
-        print(f"  {item.email}	{item.full_name}	{status}{note}")
+        print(
+            f"  {item.email}	{item.full_name}	{status}"
+            f"	вх. {_day(item.last_incoming) or chr(8212)}"
+            f"	исх. {_day(item.last_outgoing) or chr(8212)}"
+        )
     if scan.truncated:
         print("Внимание: журнал большой, просмотрена только часть — уменьшите --days")
 
     if args.out and dormant:
-        fields = ["last", "first", "nickname", "email", "is_enabled", "created_at"]
+        fields = [
+            "last", "first", "nickname", "email", "is_enabled",
+            "last_incoming", "last_outgoing", "created_at",
+        ]
         rows = [{
             "last": (item.user.get("name") or {}).get("last", ""),
             "first": (item.user.get("name") or {}).get("first", ""),
             "nickname": item.user.get("nickname", ""),
             "email": item.email,
             "is_enabled": "да" if item.enabled else "нет",
+            "last_incoming": _day(item.last_incoming),
+            "last_outgoing": _day(item.last_outgoing),
             "created_at": item.created,
         } for item in dormant]
         if str(args.out).lower().endswith(".xlsx") and xlsx.available():
@@ -352,6 +366,10 @@ def cmd_dormant(directory: Directory, args) -> int:
             path = write_rows(args.out, rows, fields)
         print(f"Список сохранён: {path}")
     return 0
+
+
+def _day(moment) -> str:
+    return moment.astimezone().strftime("%Y-%m-%d") if moment else ""
 
 
 def cmd_export(directory: Directory, args) -> int:

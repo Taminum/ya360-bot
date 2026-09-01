@@ -468,6 +468,35 @@ def test_dormant():
     check("ivan.ivanov" not in dormant2, "опознан по uid без логина")
     check("maria.petrova" not in dormant2, "опознан по полному адресу в другом регистре")
 
+    # даты последнего входящего и исходящего для отчёта
+    from y360.activity import fill_traffic_dates
+
+    history = FakeClient()
+    long_ago = (now - timedelta(days=300)).isoformat().replace("+00:00", "Z")
+    older = (now - timedelta(days=120)).isoformat().replace("+00:00", "Z")
+    history.events = [
+        {"userUid": "2", "userLogin": "maria.petrova", "eventType": "message_receive",
+         "date": older},
+        {"userUid": "2", "userLogin": "maria.petrova", "eventType": "mailbox_send",
+         "date": long_ago},
+    ]
+    fill_traffic_dates(history, scan, dormant, days=365)
+    maria_row = next(i for i in dormant if i.user["nickname"] == "maria.petrova")
+    check(
+        maria_row.last_incoming.strftime("%Y-%m-%d") == older[:10],
+        "дата последнего входящего проставлена",
+    )
+    check(
+        maria_row.last_outgoing.strftime("%Y-%m-%d") == long_ago[:10],
+        "дата последнего исходящего найдена за пределами периода проверки",
+    )
+    check(
+        "includeUids" in history.used_params,
+        "спрашиваем журнал только по найденным людям",
+    )
+    blocked_row = next(i for i in dormant if i.user["nickname"] == "old.blocked")
+    check(blocked_row.last_incoming is None, "у кого событий нет — даты пустые")
+
     maria = next(item for item in dormant if item.user["nickname"] == "maria.petrova")
     check(maria.received_only, "видно, что письма ему приходят")
     check(maria.full_name == "Петрова Мария", "ФИО собирается для отчёта")

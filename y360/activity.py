@@ -9,6 +9,9 @@ from datetime import datetime, timedelta, timezone
 
 # Действия, которые совершает сам сотрудник.
 # message_receive намеренно не в списке: письмо приходит само, даже в мёртвый ящик.
+INCOMING_EVENTS = {"message_receive"}
+OUTGOING_EVENTS = {"mailbox_send", "message_answer", "message_forward"}
+
 ACTIVE_EVENTS = {
     "mailbox_send",
     "message_seen",
@@ -34,6 +37,7 @@ class ActivityScan:
     truncated: bool = False
     samples: list[dict] = field(default_factory=list)
     mode: str = ""            # какой вариант запроса сработал
+    params: dict = field(default_factory=dict)  # и с какими параметрами
     failures: list[str] = field(default_factory=list)  # что не сработало
 
     @property
@@ -47,6 +51,8 @@ class Dormant:
 
     user: dict
     received_only: bool  # письма приходили, но человек их не открывал
+    last_incoming: datetime | None = None
+    last_outgoing: datetime | None = None
 
     @property
     def email(self) -> str:
@@ -162,6 +168,7 @@ def collect_activity(client, days: int, max_pages: int = 500) -> ActivityScan:
     scan = ActivityScan()
     params, label, failures = probe_query(client, days)
     scan.mode = label
+    scan.params = params
     scan.failures = failures
 
     for event in client.audit_log_mail(params, max_pages=max_pages):
@@ -208,6 +215,60 @@ def find_dormant(users: list[dict], scan: ActivityScan, days: int) -> list[Dorma
             )
         )
     return sorted(result, key=lambda item: (item.enabled, item.created))
+
+
+def fill_traffic_dates(
+    client,
+    scan: ActivityScan,
+    dormant: list[Dormant],
+    days: int = 365,
+    batch: int = 25,
+    max_pages: int = 50,
+) -> None:
+    """Проставляет даты последнего входящего и исходящего письма.
+
+    Спрашиваем журнал только по этим людям (includeUids) и за более длинный период,
+    чем сама проверка: у брошенного ящика последняя переписка обычно давняя.
+    """
+    if not dormant:
+        return
+
+    incoming: dict[str, datetime] = {}
+    outgoing: dict[str, datetime] = {}
+    uids = [str(item.user.get("id")) for item in dormant if item.user.get("id")]
+
+    for start in range(0, len(uids), batch):
+        params = dict(scan.params)
+        if "afterDate" in params:
+            params["afterDate"] = iso_days_ago(days)
+        params["includeUids"] = uids[start:start + batch]
+        try:
+            events = client.audit_log_mail(params, max_pages=max_pages, retries=2)
+            for event in events:
+                moment = _parse_date(event.get("date"))
+                if not moment:
+                    continue
+                kind = event.get("eventType")
+                if kind in INCOMING_EVENTS:
+                    table = incoming
+                elif kind in OUTGOING_EVENTS:
+                    table = outgoing
+                else:
+                    continue
+                for key in event_keys(event):
+                    if key not in table or moment > table[key]:
+                        table[key] = moment
+        except Exception:  # noqa: BLE001 — без дат отчёт всё равно полезен
+            return
+
+    for item in dormant:
+        keys = user_keys(item.user)
+        item.last_incoming = max(
+            (incoming[key] for key in keys if key in incoming), default=None
+        )
+        item.last_outgoing = max(
+            (outgoing[key] for key in keys if key in outgoing), default=None
+        )
 
 
 def _parse_date(value) -> datetime | None:

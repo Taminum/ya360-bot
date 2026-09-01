@@ -20,6 +20,9 @@ TITLES = {
     "is_admin": "Админ",
     "is_dismissed": "Уволен",
     "created_at": "Создан",
+    "last_incoming": "Последнее входящее",
+    "last_outgoing": "Последнее исходящее",
+    "note": "Примечание",
 }
 
 BOOL_WORDS = {True: "да", False: "нет", "True": "да", "False": "нет"}
