@@ -183,6 +183,8 @@ docker compose run --rm cli export -o data/users.csv
 docker compose run --rm cli disable ivan.ivanov maria.petrova
 ```
 
+После `git pull` пересоберите образ — код внутри контейнера: `docker compose build cli`.
+
 Для нескольких организаций добавьте `-O ключ`, например `cli -O vtoraya dept`.
 Без Docker те же команды: `python -m y360 export -o data/users.csv`.
 

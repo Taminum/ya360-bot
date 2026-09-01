@@ -158,12 +158,18 @@ git pull && docker compose up -d --build
 Данные (`data/`) и настройки (`.env`, `config/orgs.json`) при пересборке не
 затрагиваются.
 
+Код лежит внутри образа, поэтому после `git pull` контейнер обязательно
+пересобрать — без `--build` продолжит работать старая версия. Это же касается
+разовых команд: `docker compose build cli` перед `docker compose run --rm cli …`
+(или сразу `docker compose run --rm --build cli …`, если ваша версия Compose
+поддерживает этот флаг).
+
 ## Если что-то не так
 
 Сначала запустите самопроверку — она пройдёт по шагам и скажет, где споткнулось:
 
 ```bash
-sudo docker compose run --rm cli check
+sudo docker compose build cli && sudo docker compose run --rm cli check
 ```
 
 Она проверит формат токена, покажет, какому аккаунту он принадлежит (должен быть
