@@ -82,7 +82,7 @@ class TelegramClient:
             text=text,
             parse_mode="HTML",
             disable_web_page_preview=True,
-            **kwargs,
+            **_drop_none(kwargs),
         )
 
     def edit(self, chat_id: int, message_id: int, text: str, **kwargs) -> Any:
@@ -92,7 +92,7 @@ class TelegramClient:
             message_id=message_id,
             text=text,
             parse_mode="HTML",
-            **kwargs,
+            **_drop_none(kwargs),
         )
 
     def answer_callback(self, callback_id: str, text: str = "") -> Any:
@@ -169,3 +169,8 @@ def _mask_proxy(proxy: str) -> str:
     if not password:
         return proxy
     return f"{scheme}://{user}:***@{tail}"
+
+
+def _drop_none(params: dict) -> dict:
+    """Telegram не переваривает reply_markup: null — такие поля просто не шлём."""
+    return {key: value for key, value in params.items() if value is not None}

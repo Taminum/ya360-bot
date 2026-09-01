@@ -165,6 +165,26 @@ def test_bot_parsing():
             raise AssertionError(f"ожидалась ошибка для: {bad}")
     check(True, "некорректный ввод отклоняется")
 
+    swapped = Bot.parse_input("Сакыбек Барысхан", "first_last")
+    check(
+        (swapped.first, swapped.last) == ("Сакыбек", "Барысхан"),
+        "порядок first_last: «Имя Фамилия»",
+    )
+    from y360.names import make_nickname
+    check(
+        make_nickname(swapped.first, swapped.last, "{f}.{last}") == "s.baryskhan",
+        "паспортная транслитерация: s.baryskhan",
+    )
+    check(
+        make_nickname(swapped.first, swapped.last, "{f}.{last}", "simple") == "s.baryshan",
+        "простая транслитерация: s.baryshan",
+    )
+
+    manual = Bot.parse_input("Иванов Иван | @i.ivanov | Продажи | Менеджер")
+    check(manual.nickname == "i.ivanov", "логин можно задать через @")
+    check(manual.department_name == "Продажи", "отдел не сбился из-за @логина")
+    check(manual.position == "Менеджер", "должность не сбилась")
+
 
 def test_orgs_registry():
     print("реестр организаций")
@@ -246,6 +266,70 @@ def test_delete_guard():
     )
 
 
+def test_password_store():
+    print("хранилище паролей")
+    import tempfile
+
+    from y360.state import PasswordStore
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "passwords.json"
+
+        off = PasswordStore(path, enabled=False)
+        off.save("romashka", "ivan.ivanov", "secret")
+        check(not path.exists(), "выключенное хранилище ничего не пишет")
+
+        vault = PasswordStore(path, enabled=True)
+        vault.save("romashka", "ivan.ivanov", "secret1", email="i@r.ru", at="2026-09-01")
+        vault.save("vtoraya", "ivan.ivanov", "secret2")
+        check(vault.get("romashka", "ivan.ivanov")["password"] == "secret1",
+              "пароль сохраняется и читается")
+        check(vault.get("vtoraya", "ivan.ivanov")["password"] == "secret2",
+              "организации не путаются между собой")
+        check(vault.get("romashka", "IVAN.IVANOV")["password"] == "secret1",
+              "регистр логина не важен")
+        check(vault.get("romashka", "нет.такого") is None, "чужой логин -> None")
+
+        vault.save("romashka", "ivan.ivanov", "secret3")
+        restored = PasswordStore(path, enabled=True)
+        check(restored.get("romashka", "ivan.ivanov")["password"] == "secret3",
+              "новый пароль вытесняет старый и переживает рестарт")
+        check(restored.all_for("romashka") == {"ivan.ivanov": "secret3"},
+              "выборка по организации для выгрузки")
+
+
+def test_xlsx():
+    print("выгрузка в Excel")
+    import tempfile
+
+    from y360 import xlsx
+
+    if not xlsx.available():
+        check(True, "openpyxl не установлен — пропускаю")
+        return
+
+    from openpyxl import load_workbook
+
+    with tempfile.TemporaryDirectory() as tmp:
+        rows = [
+            {"last": "Иванов", "first": "Иван", "nickname": "ivan.ivanov",
+             "email": "i@r.ru", "password": "sec", "is_enabled": "да"},
+            {"last": "Петрова", "first": "Мария", "nickname": "maria.petrova",
+             "email": "m@r.ru", "password": "", "is_enabled": "нет"},
+        ]
+        fields = ["last", "first", "nickname", "email", "password", "is_enabled"]
+        path = xlsx.write_users(Path(tmp) / "users.xlsx", rows, fields)
+
+        sheet = load_workbook(path).active
+        check(sheet.title == "Сотрудники", "лист назван по-человечески")
+        check([c.value for c in sheet[1]][:2] == ["Фамилия", "Имя"],
+              "шапка переведена на русский")
+        check(sheet.max_row == 3, "две строки данных под шапкой")
+        check(sheet.freeze_panes == "A2" and sheet.auto_filter.ref,
+              "шапка закреплена, фильтр включён")
+        check([c.value for c in sheet[2]][4] == "sec", "пароль попал в таблицу")
+
+
 def test_bot_wiring():
     print("сборка бота (без сети)")
     import os
@@ -263,6 +347,7 @@ def test_bot_wiring():
             "DATA_DIR": tmp,
             "Y360_ORGS_FILE": str(Path(tmp) / "нет.json"),
             "BOT_ALLOW_DELETE": "true",
+            "BOT_STORE_PASSWORDS": "true",
         })
         instance = bot_module.Bot()
 
@@ -288,6 +373,8 @@ def test_bot_wiring():
         labels = [b["text"] for row in buttons for b in row]
         check("🔒 Заблокировать" in labels, "кнопка блокировки")
         check("🗑 Удалить" in labels, "кнопка удаления при allow_delete")
+        check("🔐 Выданный пароль" in labels, "кнопка сохранённого пароля")
+        check(instance.vault.enabled, "хранилище паролей включено флагом")
 
         os.environ["BOT_ALLOW_DELETE"] = "false"
         instance2 = bot_module.Bot()
@@ -309,6 +396,8 @@ def main():
         test_orgs_registry,
         test_state,
         test_delete_guard,
+        test_password_store,
+        test_xlsx,
         test_bot_wiring,
     ]:
         test()

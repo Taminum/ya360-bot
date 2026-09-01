@@ -118,6 +118,8 @@ BOT_DEFAULT_DEPARTMENT=Все сотрудники
 BOT_AUTO_DELETE_SECONDS=120
 # кнопку удаления сотрудника лучше включать осознанно
 BOT_ALLOW_DELETE=false
+# хранить выданные пароли, чтобы позже посмотреть их в карточке сотрудника
+BOT_STORE_PASSWORDS=true
 ```
 
 ## Шаг 6. Запуск

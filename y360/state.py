@@ -59,3 +59,59 @@ class State:
             if item.get("id") == invoice_id:
                 return item
         return None
+
+
+class PasswordStore:
+    """Выданные пароли: чтобы посмотреть их позже, а не выпускать новые.
+
+    Файл лежит рядом с данными бота в открытом виде — включайте хранение
+    осознанно (BOT_STORE_PASSWORDS) и берегите доступ к серверу.
+    """
+
+    def __init__(self, path: str | Path | None = None, enabled: bool = False):
+        self.path = Path(path) if path else data_dir() / "passwords.json"
+        self.enabled = enabled
+        self._lock = threading.Lock()
+        self._data: dict[str, dict] = {}
+        if self.path.exists():
+            try:
+                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    self._data = loaded
+            except (ValueError, OSError):
+                pass
+
+    @staticmethod
+    def _key(org_key: str, nickname: str) -> str:
+        return f"{org_key}:{nickname.lower()}"
+
+    def save(self, org_key: str, nickname: str, password: str, **extra) -> None:
+        if not self.enabled or not nickname:
+            return
+        with self._lock:
+            self._data[self._key(org_key, nickname)] = {
+                "password": password,
+                "nickname": nickname,
+                **extra,
+            }
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(tmp, self.path)
+            try:
+                os.chmod(self.path, 0o600)  # только владелец
+            except OSError:
+                pass
+
+    def get(self, org_key: str, nickname: str) -> dict | None:
+        return self._data.get(self._key(org_key, nickname))
+
+    def all_for(self, org_key: str) -> dict[str, str]:
+        prefix = f"{org_key}:"
+        return {
+            record["nickname"]: record.get("password", "")
+            for key, record in self._data.items()
+            if key.startswith(prefix)
+        }

@@ -2,7 +2,7 @@ import re
 import secrets
 import unicodedata
 
-# Транслитерация по «паспортному» варианту — так же, как обычно делают логины.
+# Паспортный вариант (загранпаспорт РФ): Хан -> Khan, Юлия -> Iuliia.
 TRANSLIT = {
     "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
     "ж": "zh", "з": "z", "и": "i", "й": "i", "к": "k", "л": "l", "м": "m",
@@ -19,11 +19,23 @@ DIGITS = "23456789"                            # без 0 и 1
 SPECIALS = "!@#$%*-_=+"
 
 
-def translit(text: str) -> str:
+# Привычный «айтишный» вариант: Хан -> Han, Юлия -> Yuliya.
+# Им обычно заведены почты, сделанные руками.
+TRANSLIT_SIMPLE = {
+    **TRANSLIT,
+    "х": "h", "ц": "c", "щ": "sch", "ы": "y", "й": "y",
+    "ю": "yu", "я": "ya", "ё": "yo", "э": "e",
+}
+
+STYLES = {"passport": TRANSLIT, "simple": TRANSLIT_SIMPLE}
+
+
+def translit(text: str, style: str = "passport") -> str:
+    table = STYLES.get(style, TRANSLIT)
     result = []
     for char in (text or "").strip().lower():
-        if char in TRANSLIT:
-            result.append(TRANSLIT[char])
+        if char in table:
+            result.append(table[char])
         elif char.isascii() and char.isalnum():
             result.append(char)
         elif char in " -_.":
@@ -39,10 +51,12 @@ def translit(text: str) -> str:
     return slug
 
 
-def make_nickname(first: str, last: str, pattern: str = "{first}.{last}") -> str:
+def make_nickname(
+    first: str, last: str, pattern: str = "{first}.{last}", style: str = "passport"
+) -> str:
     """Логин из имени/фамилии по шаблону: {first} {last} {f} {l}."""
-    first_slug = translit(first)
-    last_slug = translit(last)
+    first_slug = translit(first, style)
+    last_slug = translit(last, style)
     nickname = pattern.format(
         first=first_slug,
         last=last_slug,

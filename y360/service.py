@@ -180,13 +180,18 @@ class Directory:
         user: NewUser,
         nickname_pattern: str = "{first}.{last}",
         password_length: int = 14,
+        translit_style: str = "passport",
         refresh: bool = False,
     ) -> NewUser:
         if not user.nickname:
-            base = make_nickname(user.first, user.last, nickname_pattern)
+            base = make_nickname(
+                user.first, user.last, nickname_pattern, translit_style
+            )
             user.nickname = unique_nickname(base, self.taken_nicknames(refresh=refresh))
         else:
-            user.nickname = translit(user.nickname) or user.nickname.lower()
+            user.nickname = (
+                translit(user.nickname, translit_style) or user.nickname.lower()
+            )
         if not user.password:
             user.password = generate_password(password_length)
         if not user.display_name:

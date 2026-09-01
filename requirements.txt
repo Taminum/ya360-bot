@@ -1,1 +1,2 @@
 requests[socks]>=2.31
+openpyxl>=3.1

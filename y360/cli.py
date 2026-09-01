@@ -11,6 +11,7 @@ from .config import load_env
 from .csvio import GENDER_ALIASES, read_rows, write_rows
 from .orgs import OrgRegistry
 from .service import Directory, NewUser
+from . import xlsx
 
 log = logging.getLogger("y360.cli")
 
@@ -47,7 +48,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("dept", help="список отделов")
 
     export = sub.add_parser("export", help="выгрузить всех сотрудников в CSV")
-    export.add_argument("-o", "--out", default="out/users.csv")
+    export.add_argument(
+        "-o", "--out", default="out/users.csv",
+        help="файл выгрузки; расширение .xlsx даёт таблицу Excel",
+    )
 
     create = sub.add_parser("create", help="создать сотрудников из CSV")
     create.add_argument("-f", "--file", required=True, help="входной CSV")
@@ -60,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument(
         "--nickname-pattern", default="{first}.{last}",
         help="шаблон логина: {first} {last} {f} {l}",
+    )
+    create.add_argument(
+        "--translit", choices=["passport", "simple"], default=None,
+        help="стиль транслитерации: passport (Хан->Khan) или simple (Хан->Han)",
     )
     create.add_argument("--password-length", type=int, default=14)
     create.add_argument(
@@ -112,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "export":
             return cmd_export(directory, args)
         if args.command == "create":
+            args._org_translit = registry.get(args.org_key).translit
             return cmd_create(directory, args)
         if args.command == "disable":
             return cmd_disable(directory, args)
@@ -311,7 +320,13 @@ def cmd_export(directory: Directory, args) -> int:
             "is_dismissed": user.get("isDismissed", ""),
             "created_at": user.get("createdAt", ""),
         })
-    path = write_rows(args.out, rows, EXPORT_FIELDS)
+    if str(args.out).lower().endswith(".xlsx"):
+        if not xlsx.available():
+            log.error("Для .xlsx нужен openpyxl: pip install openpyxl")
+            return 1
+        path = xlsx.write_users(args.out, rows, EXPORT_FIELDS)
+    else:
+        path = write_rows(args.out, rows, EXPORT_FIELDS)
     print(f"Выгружено {len(rows)} сотрудников -> {path}")
     return 0
 
@@ -323,6 +338,7 @@ def cmd_create(directory: Directory, args) -> int:
         return 1
 
     directory.taken_nicknames(refresh=True)
+    org_translit = getattr(args, "_org_translit", "passport")
     results: list[dict] = []
     created_count = 0
     failed_count = 0
@@ -353,6 +369,7 @@ def cmd_create(directory: Directory, args) -> int:
             user,
             nickname_pattern=args.nickname_pattern,
             password_length=args.password_length,
+            translit_style=args.translit or org_translit,
         )
 
         if args.dry_run:

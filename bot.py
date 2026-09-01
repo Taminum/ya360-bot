@@ -21,8 +21,9 @@ from y360.csvio import read_rows, write_rows
 from y360.names import generate_password
 from y360.orgs import Org, OrgRegistry
 from y360.service import Directory, NewUser
-from y360.state import State, data_dir
+from y360.state import PasswordStore, State, data_dir
 from y360.telegram import TelegramClient, TelegramError
+from y360 import xlsx
 
 log = logging.getLogger("y360.bot")
 
@@ -32,10 +33,13 @@ HELP = """<b>Что умею</b>
 <code>Иванов Иван</code>
 <code>Иванов Иван Иванович</code>
 <code>Иванов Иван | Отдел продаж | Менеджер | +79990000001</code>
+Логин задаётся вручную через <code>@</code>:
+<code>Иванов Иван | @i.ivanov</code>
 
 <b>Команды</b>
 /find Иванов — карточка сотрудника: блокировка, сброс пароля, удаление
 /dept — отделы с их ID
+/export — все сотрудники таблицей
 /org — выбрать организацию
 /bill — оплата и архив счетов
 /id — ваш Telegram ID
@@ -61,7 +65,14 @@ class Bot:
         self.state = State()
         self.allowed = self._parse_allowed(os.environ.get("TELEGRAM_ALLOWED_USERS", ""))
         self.auto_delete = int(os.environ.get("BOT_AUTO_DELETE_SECONDS", "0"))
+        self.name_order = (
+            os.environ.get("BOT_NAME_ORDER", "last_first").strip().lower()
+        )
         self.log_passwords = _flag("BOT_LOG_PASSWORDS", False)
+        self.vault = PasswordStore(
+            os.environ.get("BOT_PASSWORDS_FILE") or None,
+            enabled=_flag("BOT_STORE_PASSWORDS", False),
+        )
         self.audit_path = Path(
             os.environ.get("BOT_AUDIT_FILE", str(data_dir() / "journal.csv"))
         )
@@ -92,6 +103,14 @@ class Bot:
     def directory_for(self, chat_id: int) -> Directory:
         return self.registry.directory(self.org_for(chat_id).key)
 
+    def help_text(self) -> str:
+        """Примеры в справке — в том порядке ФИО, который настроен."""
+        if self.name_order == "first_last":
+            return HELP.replace("Иванов Иван Иванович", "Иван Иванов Иванович").replace(
+                "Иванов Иван", "Иван Иванов"
+            )
+        return HELP
+
     def org_prefix(self, chat_id: int) -> str:
         if len(self.registry) < 2:
             return ""
@@ -107,6 +126,7 @@ class Bot:
         self.telegram.set_commands([
             ("find", "Найти сотрудника"),
             ("dept", "Список отделов"),
+            ("export", "Выгрузить всех в таблицу"),
             ("org", "Выбрать организацию"),
             ("bill", "Оплата и счета"),
             ("help", "Справка"),
@@ -115,8 +135,9 @@ class Bot:
         for update in self.telegram.poll():
             try:
                 self.handle(update)
-            except Exception:  # одно кривое сообщение не должно ронять бота
+            except Exception as exc:  # одно кривое сообщение не должно ронять бота
                 log.exception("Ошибка обработки обновления")
+                self._report_error(update, exc)
             self._process_deletions()
 
     def handle(self, update: dict) -> None:
@@ -145,11 +166,13 @@ class Bot:
             return
 
         if text.startswith("/help"):
-            self.telegram.send(chat_id, self.org_prefix(chat_id) + HELP)
+            self.telegram.send(chat_id, self.org_prefix(chat_id) + self.help_text())
         elif text.startswith("/org"):
             self.cmd_orgs(chat_id)
         elif text.startswith("/dept"):
             self.cmd_departments(chat_id)
+        elif text.startswith("/export"):
+            self.cmd_export(chat_id)
         elif text.startswith("/find"):
             self.cmd_find(chat_id, text[len("/find"):].strip())
         elif text.startswith("/bill"):
@@ -290,6 +313,10 @@ class Bot:
             },
             {"text": "🔑 Новый пароль", "callback_data": f"pwd:{user_id}"},
         ]]
+        if self.vault.enabled:
+            rows.append(
+                [{"text": "🔐 Выданный пароль", "callback_data": f"pv:{user_id}"}]
+            )
         if self.org_for(chat_id).allow_delete:
             rows.append([{"text": "🗑 Удалить", "callback_data": f"del:{user_id}"}])
         return {"inline_keyboard": rows}
@@ -314,7 +341,7 @@ class Bot:
         org = self.org_for(chat_id)
         directory = self.directory_for(chat_id)
         try:
-            new_user = self.parse_input(text)
+            new_user = self.parse_input(text, self.name_order)
         except ValueError as exc:
             self.telegram.send(chat_id, f"{html.escape(str(exc))}\n\n{HELP}")
             return
@@ -341,6 +368,7 @@ class Bot:
                 new_user,
                 nickname_pattern=org.nickname_pattern,
                 password_length=org.password_length,
+                translit_style=org.translit,
             )
         except ApiError as exc:
             self.telegram.send(chat_id, _api_error(exc))
@@ -412,6 +440,10 @@ class Bot:
             lines.append(f"<i>Сообщение удалится через {self.auto_delete} с.</i>")
 
         self.telegram.edit(chat_id, message_id, "\n".join(lines))
+        self.vault.save(
+            org.key, new_user.nickname, new_user.password,
+            email=email, at=_now(), by=_who(sender), action="create",
+        )
         self._audit(org, "create", new_user, email, sender, "ok", "")
         if self.auto_delete:
             self.to_delete.append((chat_id, message_id, time.time() + self.auto_delete))
@@ -456,6 +488,11 @@ class Bot:
             self.telegram.send(chat_id, _api_error(exc))
             return
 
+        self.vault.save(
+            org.key, str(user.get("nickname", "")), password,
+            email=str(user.get("email", "")), at=_now(), by=_who(sender),
+            action="reset",
+        )
         self._audit_user(
             org, "password", user, sender, "ok", "",
             password=password if self.log_passwords else "",
@@ -473,6 +510,102 @@ class Bot:
                 (chat_id, sent["message_id"], time.time() + self.auto_delete)
             )
         _ = message_id
+
+    def show_saved_password(self, chat_id: int, user_id: str) -> None:
+        org = self.org_for(chat_id)
+        user = self.directory_for(chat_id).user_by_id(user_id) or {}
+        nickname = str(user.get("nickname", ""))
+        record = self.vault.get(org.key, nickname)
+        if not record:
+            self.telegram.send(
+                chat_id,
+                "Пароль не сохранён — сотрудник заведён до включения хранения "
+                "или менял пароль сам.\nВыдайте новый кнопкой «🔑 Новый пароль».",
+            )
+            return
+        issued = str(record.get("at", ""))[:16].replace("T", " ")
+        lines = [
+            f"🔐 <b>{html.escape(_full_name(user))}</b>",
+            f"Почта: <code>{html.escape(str(user.get('email', '')))}</code>",
+            f"Пароль: <code>{html.escape(record.get('password', ''))}</code>",
+            f"<i>выдан {issued}</i>",
+        ]
+        sent = self.telegram.send(chat_id, "\n".join(lines))
+        if self.auto_delete:
+            self.to_delete.append(
+                (chat_id, sent["message_id"], time.time() + self.auto_delete)
+            )
+
+    def cmd_export(self, chat_id: int) -> None:
+        org = self.org_for(chat_id)
+        directory = self.directory_for(chat_id)
+        notice = self.telegram.send(chat_id, "⏳ Собираю выгрузку…")
+
+        try:
+            users = directory.users(refresh=True)
+            departments = {
+                int(item.get("id", 0)): str(item.get("name", ""))
+                for item in directory.departments(refresh=True)
+            }
+        except ApiError as exc:
+            self.telegram.edit(chat_id, notice["message_id"], _api_error(exc))
+            return
+
+        passwords = self.vault.all_for(org.key) if self.vault.enabled else {}
+        fields = [
+            "last", "first", "middle", "nickname", "email", "aliases",
+            "department", "position", "phone", "is_enabled", "created_at",
+        ]
+        if passwords:
+            fields.insert(6, "password")
+
+        rows = []
+        for user in sorted(users, key=lambda u: _full_name(u).lower()):
+            name = user.get("name") or {}
+            phones = [
+                c.get("value") for c in user.get("contacts") or []
+                if c.get("type") == "phone" and not c.get("synthetic")
+            ]
+            nickname = str(user.get("nickname", ""))
+            rows.append({
+                "last": name.get("last", ""),
+                "first": name.get("first", ""),
+                "middle": name.get("middle", ""),
+                "nickname": nickname,
+                "email": user.get("email", ""),
+                "password": passwords.get(nickname, ""),
+                "aliases": " ".join(user.get("aliases") or []),
+                "department": departments.get(int(user.get("departmentId", 0) or 0), ""),
+                "position": user.get("position", ""),
+                "phone": phones[0] if phones else "",
+                "is_enabled": "да" if user.get("isEnabled", True) else "нет",
+                "created_at": str(user.get("createdAt", ""))[:10],
+            })
+
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        directory_path = data_dir() / "exports"
+        try:
+            if xlsx.available():
+                path = xlsx.write_users(
+                    directory_path / f"{org.key}_{stamp}.xlsx", rows, fields
+                )
+            else:
+                path = write_rows(
+                    directory_path / f"{org.key}_{stamp}.csv", rows, fields
+                )
+        except Exception as exc:
+            log.exception("Не удалось собрать выгрузку")
+            self.telegram.edit(
+                chat_id, notice["message_id"],
+                f"Не удалось собрать файл: <code>{html.escape(str(exc))}</code>",
+            )
+            return
+
+        caption = f"Сотрудники «{org.title}» — {len(rows)}"
+        if passwords:
+            caption += ", включая выданные пароли"
+        self.telegram.upload_document(chat_id, str(path), caption)
+        self.telegram.delete(chat_id, notice["message_id"])
 
     def ask_delete(self, chat_id: int, user_id: str) -> None:
         org = self.org_for(chat_id)
@@ -649,6 +782,8 @@ class Bot:
             self.do_block(chat_id, message_id, sender, user_id, flag == "1")
         elif action == "pwd":
             self.do_password(chat_id, message_id, sender, payload)
+        elif action == "pv":
+            self.show_saved_password(chat_id, payload)
         elif action == "del":
             self.ask_delete(chat_id, payload)
         elif action == "inv":
@@ -656,25 +791,60 @@ class Bot:
 
     # --- разбор ввода ----------------------------------------------------------
     @staticmethod
-    def parse_input(text: str) -> NewUser:
-        """«Фамилия Имя [Отчество] | отдел | должность | телефон»."""
+    def parse_input(text: str, order: str = "last_first") -> NewUser:
+        """«Фамилия Имя [Отчество] | отдел | должность | телефон».
+
+        При BOT_NAME_ORDER=first_last ждём обратный порядок: «Имя Фамилия».
+        """
         parts = [part.strip() for part in text.split("|")]
         fio = parts[0].split()
+        expected = (
+            "Имя Фамилия Отчество" if order == "first_last" else "Фамилия Имя Отчество"
+        )
         if len(fio) < 2:
-            raise ValueError("Нужны минимум фамилия и имя.")
+            raise ValueError(f"Нужны минимум два слова — жду «{expected}».")
         if len(fio) > 3:
-            raise ValueError("Слишком много слов в ФИО — жду «Фамилия Имя Отчество».")
+            raise ValueError(f"Слишком много слов в ФИО — жду «{expected}».")
 
-        user = NewUser(last=fio[0], first=fio[1], middle=fio[2] if len(fio) > 2 else "")
-        if len(parts) > 1 and parts[1]:
-            user.department_name = parts[1]
-        if len(parts) > 2 and parts[2]:
-            user.position = parts[2]
-        if len(parts) > 3 and parts[3]:
-            user.phone = parts[3]
+        if order == "first_last":
+            user = NewUser(first=fio[0], last=fio[1])
+        else:
+            user = NewUser(last=fio[0], first=fio[1])
+        user.middle = fio[2] if len(fio) > 2 else ""
+
+        # «@логин» в любом месте задаёт адрес вручную, остальное — по порядку
+        rest = []
+        for part in parts[1:]:
+            if part.startswith("@"):
+                user.nickname = part[1:].strip().split("@")[0]
+            else:
+                rest.append(part)
+        if len(rest) > 0 and rest[0]:
+            user.department_name = rest[0]
+        if len(rest) > 1 and rest[1]:
+            user.position = rest[1]
+        if len(rest) > 2 and rest[2]:
+            user.phone = rest[2]
         return user
 
     # --- служебное ---------------------------------------------------------------
+    def _report_error(self, update: dict, exc: Exception) -> None:
+        """Молчащий бот хуже бота с ошибкой — пишем в чат, а не только в лог."""
+        message = update.get("message") or (update.get("callback_query") or {}).get(
+            "message"
+        ) or {}
+        chat_id = (message.get("chat") or {}).get("id")
+        if not chat_id:
+            return
+        try:
+            self.telegram.send(
+                chat_id,
+                "⚠️ Внутренняя ошибка: "
+                f"<code>{html.escape(self.telegram.safe(exc))}</code>",
+            )
+        except TelegramError:
+            pass
+
     def _gc_pending(self, ttl: int = 900) -> None:
         now = time.time()
         for key in [k for k, v in self.pending.items() if now - v["created_at"] > ttl]:
@@ -744,6 +914,14 @@ def _full_name(user: dict) -> str:
 
 def _join(*parts) -> str:
     return " ".join(str(part) for part in parts if part)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def _who(sender: dict) -> str:
+    return f"{sender.get('id')} @{sender.get('username', '')}".strip()
 
 
 def _api_error(exc: ApiError) -> str:

@@ -21,6 +21,7 @@ class Org:
     domain: str = ""
     default_department: str = ""
     nickname_pattern: str = "{first}.{last}"
+    translit: str = "passport"
     password_length: int = 14
     password_change_required: bool = True
     allow_delete: bool = False
@@ -88,6 +89,7 @@ class OrgRegistry:
                     nickname_pattern=str(
                         item.get("nickname_pattern", "{first}.{last}")
                     ),
+                    translit=str(item.get("translit", "passport")),
                     password_length=int(item.get("password_length", 14)),
                     password_change_required=bool(
                         item.get("password_change_required", True)
@@ -114,6 +116,7 @@ class OrgRegistry:
                 nickname_pattern=os.environ.get(
                     "Y360_NICKNAME_PATTERN", "{first}.{last}"
                 ),
+                translit=os.environ.get("Y360_TRANSLIT", "passport"),
                 password_length=int(os.environ.get("Y360_PASSWORD_LENGTH", "14")),
                 password_change_required=_flag("Y360_PASSWORD_CHANGE_REQUIRED", True),
                 allow_delete=_flag("BOT_ALLOW_DELETE", False),
