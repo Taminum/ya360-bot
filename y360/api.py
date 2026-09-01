@@ -43,19 +43,22 @@ class Y360Client:
         )
 
     # --- низкий уровень -------------------------------------------------
-    def request(self, method: str, path: str, **kwargs) -> Any:
+    def request(
+        self, method: str, path: str, retries: int | None = None, **kwargs
+    ) -> Any:
         url = BASE_URL + path
         delay = 1.0
         last_error: Exception | None = None
+        attempts = retries or self.max_retries
 
-        for attempt in range(1, self.max_retries + 1):
+        for attempt in range(1, attempts + 1):
             try:
                 response = self.session.request(
                     method, url, timeout=self.timeout, **kwargs
                 )
             except requests.RequestException as exc:  # сеть моргнула
                 last_error = exc
-                log.warning("Сетевая ошибка (%s/%s): %s", attempt, self.max_retries, exc)
+                log.warning("Сетевая ошибка (%s/%s): %s", attempt, attempts, exc)
                 time.sleep(delay)
                 delay = min(delay * 2, 30)
                 continue
@@ -68,7 +71,7 @@ class Y360Client:
                     response.status_code,
                     wait,
                     attempt,
-                    self.max_retries,
+                    attempts,
                 )
                 last_error = ApiError(method, url, response.status_code, _body(response))
                 time.sleep(wait)
@@ -98,7 +101,8 @@ class Y360Client:
             page += 1
 
     def paginate_token(
-        self, path: str, key: str, params: dict, max_pages: int = 500
+        self, path: str, key: str, params: dict, max_pages: int = 500,
+        retries: int | None = None,
     ) -> Iterator[dict]:
         """Пагинация через nextPageToken — так устроены аудит-логи."""
         token = None
@@ -106,7 +110,7 @@ class Y360Client:
             query = dict(params)
             if token:
                 query["pageToken"] = token
-            data = self.request("GET", path, params=query)
+            data = self.request("GET", path, params=query, retries=retries)
             for item in data.get(key, []):
                 yield item
             token = data.get("nextPageToken")
@@ -115,20 +119,16 @@ class Y360Client:
         log.warning("Достигнут предел в %s страниц для %s", max_pages, path)
 
     # --- аудит-лог ------------------------------------------------------
+    @property
+    def audit_mail_path(self) -> str:
+        return f"/security/v1/org/{self._org()}/audit_log/mail"
+
     def audit_log_mail(
-        self,
-        after_date: str,
-        before_date: str | None = None,
-        page_size: int = 100,
-        max_pages: int = 500,
+        self, params: dict, max_pages: int = 500, retries: int | None = None
     ) -> Iterator[dict]:
-        """События Почты за период. Нужно право ya360_security:audit_log_mail."""
-        params: dict[str, Any] = {"pageSize": page_size, "afterDate": after_date}
-        if before_date:
-            params["beforeDate"] = before_date
+        """События Почты. Нужно право ya360_security:audit_log_mail."""
         return self.paginate_token(
-            f"/security/v1/org/{self._org()}/audit_log/mail",
-            "events", params, max_pages,
+            self.audit_mail_path, "events", params, max_pages, retries
         )
 
     # --- организации ----------------------------------------------------

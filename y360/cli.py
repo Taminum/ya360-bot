@@ -9,7 +9,7 @@ from datetime import datetime
 from .api import ApiError, Y360Client
 from .config import load_env
 from .csvio import GENDER_ALIASES, read_rows, write_rows
-from .activity import collect_activity, find_dormant
+from .activity import AuditUnavailable, collect_activity, find_dormant
 from .orgs import OrgRegistry
 from .service import Directory, NewUser
 from . import xlsx
@@ -308,13 +308,25 @@ def cmd_dormant(directory: Directory, args) -> int:
     days = max(7, min(args.days, 365))
     print(f"Читаю аудит-лог Почты за {days} дн. …")
     users = directory.users(refresh=True)
-    scan = collect_activity(directory.client, days)
+    try:
+        scan = collect_activity(directory.client, days)
+    except AuditUnavailable as exc:
+        print("Аудит-лог Почты не отвечает ни на один вариант запроса:")
+        for item in exc.failures:
+            print(f"  - {item}")
+        print(
+            "Проверьте право ya360_security:audit_log_mail у приложения, "
+            "перевыпустите токен после его выдачи и убедитесь, что аудит-лог "
+            "входит в ваш тариф."
+        )
+        return 1
     dormant = find_dormant(users, scan, days)
 
     print(
         f"Сотрудников: {len(users)}, событий в журнале: {scan.events}, "
         f"без активности: {len(dormant)}"
     )
+    print(f"Запрос: {scan.mode}")
     if scan.samples and args.verbose:
         print("Пример события:", scan.samples[0])
     for item in dormant:

@@ -17,6 +17,9 @@ class FakeClient:
         self.created: list[dict] = []
         self.aliases: list[tuple[str, str]] = []
         self.events: list[dict] = []
+        self.probe_calls = 0
+        self.probe_failures = 0
+        self.used_params: dict = {}
 
     def departments(self):
         return [
@@ -49,7 +52,19 @@ class FakeClient:
         self.aliases.append((user_id, alias))
         return {"alias": alias}
 
-    def audit_log_mail(self, after_date, before_date=None, page_size=100, max_pages=500):
+    audit_mail_path = "/security/v1/org/1/audit_log/mail"
+
+    def request(self, method, path, retries=None, **kwargs):
+        """Пробный запрос при подборе варианта: падает столько раз, сколько велено."""
+        self.probe_calls += 1
+        if self.probe_calls <= self.probe_failures:
+            from y360.api import ApiError
+
+            raise ApiError(method, path, 500, "Ошибка сервера")
+        return {"events": [], "nextPageToken": None}
+
+    def audit_log_mail(self, params, max_pages=500, retries=None):
+        self.used_params = params
         return iter(self.events)
 
 
@@ -419,6 +434,27 @@ def test_dormant():
     check("old.blocked" in logins, "заблокированный — кандидат на удаление")
     check("new.hire" not in logins, "недавно заведённого не трогаем")
     check("robot" not in logins, "роботы не считаются")
+
+    # HTTP 500 на первый вариант запроса не должен ронять команду
+    from y360.activity import AuditUnavailable, query_variants
+
+    picky = FakeClient()
+    picky.probe_failures = 2  # первые два варианта сервер отвергает
+    picky.events = [{"userLogin": "ivan.ivanov", "eventType": "mailbox_send", "date": fresh}]
+    scan3 = collect_activity(picky, 30)
+    check(scan3.mode == query_variants(30)[2][0], "подобран третий вариант запроса")
+    check(len(scan3.failures) == 2, "неудачные варианты записаны для отчёта")
+    check("500" in scan3.failures[0], "в отчёте виден код ошибки")
+    check("ivan.ivanov" in scan3.active, "после подбора события всё же прочитаны")
+
+    dead_client = FakeClient()
+    dead_client.probe_failures = 99  # сервер не отвечает ни на что
+    try:
+        collect_activity(dead_client, 30)
+    except AuditUnavailable as exc:
+        check(len(exc.failures) == len(query_variants(30)), "перебраны все варианты")
+    else:
+        raise AssertionError("ожидалась AuditUnavailable")
 
     # журнал может называть человека uid-ом или полным адресом, а не логином
     other = FakeClient()

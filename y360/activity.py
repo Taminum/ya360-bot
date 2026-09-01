@@ -33,6 +33,8 @@ class ActivityScan:
     events: int = 0
     truncated: bool = False
     samples: list[dict] = field(default_factory=list)
+    mode: str = ""            # какой вариант запроса сработал
+    failures: list[str] = field(default_factory=list)  # что не сработало
 
     @property
     def people(self) -> int:
@@ -107,11 +109,62 @@ def user_keys(user: dict) -> set[str]:
     return keys
 
 
+def query_variants(days: int) -> list[tuple[str, dict]]:
+    """Разные написания одного и того же запроса.
+
+    Аудит-лог отвечает HTTP 500 на неудобные ему параметры, поэтому
+    подбираем рабочий вариант, а не гадаем.
+    """
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    after = now - timedelta(days=days)
+    z_form = after.isoformat().replace("+00:00", "Z")
+    offset_form = after.isoformat()
+
+    return [
+        ("afterDate с Z", {"pageSize": 100, "afterDate": z_form}),
+        ("afterDate с +00:00", {"pageSize": 100, "afterDate": offset_form}),
+        (
+            "afterDate и beforeDate",
+            {
+                "pageSize": 100,
+                "afterDate": z_form,
+                "beforeDate": now.isoformat().replace("+00:00", "Z"),
+            },
+        ),
+        ("только дата без времени", {"pageSize": 100, "afterDate": after.date().isoformat()}),
+        ("страница по 50", {"pageSize": 50, "afterDate": z_form}),
+        ("без периода", {"pageSize": 100}),
+    ]
+
+
+def probe_query(client, days: int) -> tuple[dict, str, list[str]]:
+    """Возвращает (рабочие параметры, их название, список неудач)."""
+    failures = []
+    for label, params in query_variants(days):
+        try:
+            client.request(
+                "GET", client.audit_mail_path, params=dict(params, pageSize=1), retries=1
+            )
+            return params, label, failures
+        except Exception as exc:  # noqa: BLE001 — нам важен сам факт отказа
+            failures.append(f"{label}: {_short(exc)}")
+    raise AuditUnavailable(failures)
+
+
+class AuditUnavailable(RuntimeError):
+    def __init__(self, failures: list[str]):
+        self.failures = failures
+        super().__init__("Аудит-лог Почты не отвечает ни на один вариант запроса")
+
+
 def collect_activity(client, days: int, max_pages: int = 500) -> ActivityScan:
     """Читает аудит-лог Почты и раскладывает события по людям."""
     scan = ActivityScan()
+    params, label, failures = probe_query(client, days)
+    scan.mode = label
+    scan.failures = failures
 
-    for event in client.audit_log_mail(iso_days_ago(days), max_pages=max_pages):
+    for event in client.audit_log_mail(params, max_pages=max_pages):
         scan.events += 1
         if len(scan.samples) < 5:
             scan.samples.append({
@@ -168,3 +221,11 @@ def _parse_date(value) -> datetime | None:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     return moment
+
+
+def _short(exc: Exception, limit: int = 90) -> str:
+    text = str(exc)
+    marker = " -> "
+    if marker in text:
+        text = text.split(marker, 1)[1]
+    return text[:limit]

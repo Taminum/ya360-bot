@@ -16,7 +16,12 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from y360.activity import collect_activity, find_dormant, user_keys
+from y360.activity import (
+    AuditUnavailable,
+    collect_activity,
+    find_dormant,
+    user_keys,
+)
 from y360.api import ApiError
 from y360.config import load_env, require
 from y360.csvio import read_rows, write_rows
@@ -914,7 +919,8 @@ class Bot:
             self.org_prefix(chat_id) + f"<b>Неиспользуемые ящики за {days} дн.</b>",
             f"Всего сотрудников: {len(users)} · без активности: {len(dormant)}",
             f"<i>Событий в журнале: {scan.events}, из них активных людей: "
-            f"{self._matched(users, scan)} из {len(users)}</i>",
+            f"{self._matched(users, scan)} из {len(users)}"
+            + (f" · запрос: {scan.mode}" if scan.mode else "") + "</i>",
             "",
         ]
         if idle:
@@ -970,6 +976,7 @@ class Bot:
         lines = [
             f"<b>Отладка /dead за {days} дн.</b>",
             f"Событий: {scan.events} · активных ключей: {len(scan.active)}",
+            f"Рабочий вариант запроса: {html.escape(scan.mode or 'не найден')}",
             f"Сотрудников: {len(users)} · опознано активными: "
             f"{self._matched(users, scan)}",
             "",
